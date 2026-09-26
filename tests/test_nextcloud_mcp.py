@@ -15,7 +15,6 @@ import http.client
 import importlib.util
 import io
 import json
-from pathlib import Path
 import posixpath
 import re
 import sys
@@ -24,9 +23,11 @@ import tempfile
 import threading
 import unittest
 import urllib.parse
+import xml.etree.ElementTree as ET
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import xml.etree.ElementTree as ET
+from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'nextcloud_mcp.py'
@@ -98,6 +99,24 @@ class WriteGuardTests(unittest.TestCase):
     def test_other_paths_under_music_are_allowed(self):
         mcp.ensure_write_allowed('/music/YouTube/song.mp3')
         mcp.ensure_write_allowed('/music/ConvertedExtra/song.mp3')
+
+    def test_ancestors_of_a_denied_prefix_are_refused(self):
+        # Moving/deleting/overwriting an ancestor would take the protected
+        # subtree with it, so /music and / must be refused too.
+        for path in ('/music', '/MUSIC', '/music/', '/', ''):
+            with self.assertRaises(mcp.ToolError, msg=path):
+                mcp.ensure_write_allowed(path)
+
+    def test_a_sibling_prefix_is_not_treated_as_an_ancestor(self):
+        mcp.ensure_write_allowed('/mus')
+        mcp.ensure_write_allowed('/music2')
+        mcp.ensure_write_allowed('/music/ConvertedX')
+
+    def test_ancestor_rule_follows_the_configured_deny_prefixes(self):
+        config = make_config(NEXTCLOUD_MCP_WRITE_DENY='/private/inner')
+        with self.assertRaises(mcp.ToolError):
+            mcp.ensure_write_allowed('/private', config)
+        mcp.ensure_write_allowed('/privateer', config)
 
     def test_the_converted_prefix_follows_the_configured_music_root(self):
         config = make_config(NEXTCLOUD_MCP_MUSIC_ROOT='/audio')
@@ -225,6 +244,13 @@ class ConfigTests(unittest.TestCase):
                              'NEXTCLOUD_MCP_WRITE_DENY': '/x, y/, ,/z///'})
         self.assertEqual(config.write_deny_prefixes,
                          ('/audio/Converted', '/x', '/y', '/z'))
+
+    def test_allowed_origins_parse_comma_separated_values(self):
+        config = mcp.Config({'NEXTCLOUD_MCP_ALLOWED_ORIGINS':
+                             'https://a.example, http://b.example/ , '})
+        self.assertEqual(config.allowed_origins,
+                         ('https://a.example', 'http://b.example'))
+        self.assertEqual(mcp.Config({}).allowed_origins, ())
 
 
 def dav_multistatus(prefix, entries):
@@ -374,6 +400,83 @@ class ArchiveRoundTripTests(unittest.TestCase):
         self.assertEqual(total, 5)
         with zipfile.ZipFile(target) as zf:
             self.assertEqual(zf.read('src.bin'), b'hello')
+
+    def test_the_member_guard_runs_for_every_zip_member_before_writing(self):
+        archive = self.workdir / 'guard.zip'
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('a.txt', 'A')
+            zf.writestr('dir/b.txt', 'B')
+        destination = self.workdir / 'out-guard'
+        destination.mkdir()
+        seen = []
+
+        def guard(name):
+            seen.append(name)
+            if name == 'dir/b.txt':
+                raise mcp.ToolError('blocked')
+
+        with self.assertRaises(mcp.ToolError):
+            mcp.extract_archive_file(archive, 'zip', destination, self.config, member_guard=guard)
+        self.assertEqual(seen, ['a.txt', 'dir/b.txt'])
+        self.assertFalse((destination / 'dir/b.txt').exists())
+
+    def test_the_member_guard_is_applied_to_tar_members_too(self):
+        archive = self.workdir / 'guard.tar'
+        payload = self.workdir / 'payload.txt'
+        payload.write_text('tar-content')
+        with tarfile.open(archive, 'w') as tf:
+            tf.add(payload, arcname='nested/payload.txt')
+        destination = self.workdir / 'out-guard-tar'
+        destination.mkdir()
+        seen = []
+
+        def guard(name):
+            seen.append(name)
+            raise mcp.ToolError('blocked')
+
+        with self.assertRaises(mcp.ToolError):
+            mcp.extract_archive_file(archive, 'tar', destination, self.config, member_guard=guard)
+        self.assertEqual(seen, ['nested/payload.txt'])
+
+
+class ArchiveSizePrecheckTests(unittest.TestCase):
+    """list_archive/create_zip stat sizes before downloading anything."""
+
+    def setUp(self):
+        self.config = make_config(NEXTCLOUD_MCP_MAX_ZIP_BYTES='10')
+        self.client = FakeNextcloudClient(files={
+            '/': {'is_dir': True, 'writable': True, 'etag': 'root', 'fileid': '1'},
+            '/big.zip': {'is_dir': False, 'data': b'x' * 11, 'writable': True, 'etag': 'z'},
+            '/big.txt': {'is_dir': False, 'data': b'x' * 11, 'writable': True, 'etag': 't'},
+        })
+        self.downloads = []
+        original = self.client.download_to
+
+        def tracking(path, fileobj, timeout=None):
+            self.downloads.append(path)
+            return original(path, fileobj, timeout)
+
+        self.client.download_to = tracking
+
+    def test_list_archive_refuses_an_oversized_archive_before_downloading(self):
+        with self.assertRaises(mcp.ToolError):
+            mcp.tool_list_archive(self.client, self.config, {'path': '/big.zip'})
+        self.assertEqual(self.downloads, [])
+
+    def test_create_zip_refuses_an_oversized_source_before_downloading(self):
+        with self.assertRaises(mcp.ToolError):
+            mcp.tool_create_zip(self.client, self.config,
+                                {'paths': ['/big.txt'], 'target': '/out.zip'})
+        self.assertEqual(self.downloads, [])
+        self.assertNotIn('/out.zip', self.client.files)
+
+    def test_create_zip_allows_sizes_exactly_at_the_limit(self):
+        self.client.files['/ok.txt'] = {'is_dir': False, 'data': b'x' * 10,
+                                        'writable': True, 'etag': 'o'}
+        result = mcp.tool_create_zip(self.client, self.config,
+                                     {'paths': ['/ok.txt'], 'target': '/ok.zip'})
+        self.assertEqual(result['source_bytes'], 10)
+        self.assertEqual(self.downloads, ['/ok.txt'])
 
 
 class ToolCatalogTests(unittest.TestCase):
@@ -533,6 +636,48 @@ def music_client(root='/music'):
     })
 
 
+class MandatoryWhoamiTests(unittest.TestCase):
+    """Every tools/call verifies the caller with Nextcloud before running."""
+
+    class RejectingClient(FakeNextcloudClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.list_files_calls = 0
+
+        def whoami(self):
+            raise mcp.NextcloudError(401, 'credentials rejected')
+
+        def list_files(self, path):
+            self.list_files_calls += 1
+            return super().list_files(path)
+
+    def rejecting_client(self):
+        return self.RejectingClient(files={
+            '/': {'is_dir': True, 'writable': True, 'etag': 'root'},
+            '/notes.txt': {'is_dir': False, 'data': b'hello', 'writable': True, 'etag': 'e'},
+        })
+
+    def test_a_rejected_credential_turns_into_a_tool_error(self):
+        result = mcp.call_tool('nextcloud_list_files', {'path': '/'},
+                               self.rejecting_client(), make_config())
+        self.assertTrue(result['isError'])
+        self.assertIn('credentials rejected', result['content'][0]['text'])
+
+    def test_the_handler_never_runs_when_whoami_is_rejected(self):
+        client = self.rejecting_client()
+        result = mcp.call_tool('nextcloud_list_files', {'path': '/'}, client, make_config())
+        self.assertTrue(result['isError'])
+        self.assertEqual(client.list_files_calls, 0)
+
+    def test_a_rejected_credential_over_jsonrpc_is_a_tool_error(self):
+        response = mcp.handle_message(
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+             'params': {'name': 'nextcloud_list_files', 'arguments': {'path': '/'}}},
+            self.rejecting_client(), make_config())
+        self.assertTrue(response['result']['isError'])
+        self.assertNotIn('Internal error', response['result']['content'][0]['text'])
+
+
 class ToolHandlerTests(unittest.TestCase):
     def setUp(self):
         self.config = make_config()
@@ -564,6 +709,35 @@ class ToolHandlerTests(unittest.TestCase):
     def test_read_file_rejects_an_unknown_encoding(self):
         with self.assertRaises(mcp.ToolError):
             mcp.tool_read_file(self.client, self.config, {'path': '/notes.txt', 'encoding': 'utf-16'})
+
+    def test_read_file_clamps_a_negative_max_bytes_to_one_byte(self):
+        result = mcp.tool_read_file(self.client, self.config,
+                                    {'path': '/notes.txt', 'max_bytes': -5})
+        self.assertEqual(result['bytes'], 1)
+        self.assertTrue(result['truncated'])
+
+    def test_read_file_clamps_an_oversized_max_bytes_to_the_server_limit(self):
+        config = make_config(NEXTCLOUD_MCP_MAX_READ_BYTES='2')
+        result = mcp.tool_read_file(self.client, config,
+                                    {'path': '/notes.txt', 'max_bytes': 999})
+        self.assertEqual(result['bytes'], 2)
+
+    def test_read_file_rejects_a_non_integer_max_bytes(self):
+        for value in ('many', 1.5, [], {}):
+            with self.assertRaises(mcp.ToolError, msg=repr(value)):
+                mcp.tool_read_file(self.client, self.config,
+                                   {'path': '/notes.txt', 'max_bytes': value})
+
+    def test_a_non_integer_max_bytes_over_jsonrpc_is_not_an_internal_error(self):
+        response = mcp.handle_message(
+            {'jsonrpc': '2.0', 'id': 9, 'method': 'tools/call',
+             'params': {'name': 'nextcloud_read_file',
+                        'arguments': {'path': '/notes.txt', 'max_bytes': 'many'}}},
+            self.client, self.config)
+        self.assertTrue(response['result']['isError'])
+        text = response['result']['content'][0]['text']
+        self.assertIn('max_bytes', text)
+        self.assertNotIn('Internal error', text)
 
     def test_write_file_stores_text_content(self):
         result = mcp.tool_write_file(self.client, self.config,
@@ -616,6 +790,34 @@ class ToolHandlerTests(unittest.TestCase):
         self.assertNotIn('/notes.txt', self.client.files)
         self.assertIn('/renamed.txt', self.client.files)
 
+    def test_copy_file_refuses_a_denied_source(self):
+        self.client.files['/music/Converted'] = {'is_dir': True, 'writable': True, 'etag': 'c'}
+        self.client.files['/music/Converted/song.mp3'] = {'is_dir': False, 'data': b'x',
+                                                          'writable': True, 'etag': 's'}
+        with self.assertRaises(mcp.ToolError):
+            mcp.tool_copy_file(self.client, self.config,
+                               {'path': '/music/Converted/song.mp3', 'destination': '/copy.mp3'})
+        self.assertNotIn('/copy.mp3', self.client.files)
+
+    def test_move_file_refuses_a_denied_source(self):
+        self.client.files['/music/Converted'] = {'is_dir': True, 'writable': True, 'etag': 'c'}
+        self.client.files['/music/Converted/song.mp3'] = {'is_dir': False, 'data': b'x',
+                                                          'writable': True, 'etag': 's'}
+        with self.assertRaises(mcp.ToolError):
+            mcp.tool_move_file(self.client, self.config,
+                               {'path': '/music/Converted/song.mp3', 'destination': '/moved.mp3'})
+        self.assertIn('/music/Converted/song.mp3', self.client.files)
+
+    def test_delete_file_refuses_an_ancestor_of_a_denied_prefix(self):
+        with self.assertRaises(mcp.ToolError):
+            mcp.tool_delete_file(self.client, self.config, {'path': '/music'})
+        self.assertEqual(self.client.deleted, [])
+
+    def test_move_file_refuses_an_ancestor_of_a_denied_prefix(self):
+        with self.assertRaises(mcp.ToolError):
+            mcp.tool_move_file(self.client, self.config, {'path': '/music', 'destination': '/x'})
+        self.assertIn('/music', self.client.files)
+
     def test_delete_file_refuses_the_root_and_moves_others_to_trash(self):
         with self.assertRaises(mcp.ToolError):
             mcp.tool_delete_file(self.client, self.config, {'path': '/'})
@@ -655,6 +857,41 @@ class ToolHandlerTests(unittest.TestCase):
         self.client.files['/a.zip'] = {'is_dir': False, 'data': b'', 'writable': True, 'etag': 'z'}
         with self.assertRaises(mcp.ToolError):
             mcp.tool_extract_archive(self.client, self.config, {'path': '/a.zip', 'target': '/'})
+
+    def test_extract_archive_checks_every_member_final_path(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as archive:
+            archive.writestr('a.txt', 'A')
+            archive.writestr('sub/b.txt', 'B')
+        self.client.files['/docs.zip'] = {'is_dir': False, 'data': buffer.getvalue(),
+                                          'writable': True, 'etag': 'z'}
+        seen = []
+        original = mcp.ensure_write_allowed
+
+        def spy(path, config=None):
+            seen.append(path)
+            original(path, config)
+
+        with mock.patch.object(mcp, 'ensure_write_allowed', side_effect=spy):
+            result = mcp.tool_extract_archive(self.client, self.config,
+                                              {'path': '/docs.zip', 'target': '/restored'})
+        self.assertEqual(result['files'], 2)
+        self.assertIn('/restored', seen)
+        self.assertIn('/restored/a.txt', seen)
+        self.assertIn('/restored/sub/b.txt', seen)
+
+    def test_extract_archive_refuses_a_denied_archive_it_would_remove(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as archive:
+            archive.writestr('a.txt', 'A')
+        self.client.files['/music/Converted'] = {'is_dir': True, 'writable': True, 'etag': 'c'}
+        self.client.files['/music/Converted/a.zip'] = {'is_dir': False, 'data': buffer.getvalue(),
+                                                       'writable': True, 'etag': 'z'}
+        with self.assertRaises(mcp.ToolError):
+            mcp.tool_extract_archive(self.client, self.config,
+                                     {'path': '/music/Converted/a.zip', 'target': '/restored',
+                                      'remove_archive': True})
+        self.assertEqual(self.client.deleted, [])
 
 
 class TagToolGatingTests(unittest.TestCase):
@@ -698,10 +935,13 @@ class TagToolGatingTests(unittest.TestCase):
 
 class TagApiBridgeTests(unittest.TestCase):
     class Handler(BaseHTTPRequestHandler):
+        requests = []
+
         def log_message(self, *args):
             pass
 
         def _reply(self):
+            type(self).requests.append(self.path)
             if self.headers.get('Authorization') != 'Bearer secret-token':
                 self.send_response(401)
                 self.send_header('Content-Length', '0')
@@ -738,10 +978,16 @@ class TagApiBridgeTests(unittest.TestCase):
         self.thread.start()
         self.addCleanup(self.server.shutdown)
         self.addCleanup(self.server.server_close)
+        self.Handler.requests = []
         port = self.server.server_address[1]
         self.config = make_config(NEXTCLOUD_MCP_TAG_API_URL=f'http://127.0.0.1:{port}',
                                   NEXTCLOUD_MCP_TAG_API_TOKEN='secret-token')
         self.client = music_client()
+
+    def test_read_music_tags_stats_the_file_before_calling_the_tag_api(self):
+        with self.assertRaises(mcp.NextcloudError):
+            mcp.tool_read_music_tags(self.client, self.config, {'path': '/music/missing.mp3'})
+        self.assertEqual(self.Handler.requests, [])
 
     def test_read_music_tags_reaches_the_bridged_tag_api(self):
         result = mcp.tool_read_music_tags(self.client, self.config, {'path': '/music/song.mp3'})
@@ -788,8 +1034,14 @@ class JsonRpcDispatchTests(unittest.TestCase):
     def test_a_notification_without_an_id_returns_nothing(self):
         self.assertIsNone(mcp.handle_message({'jsonrpc': '2.0', 'method': 'ping'}, self.client, self.config))
 
-    def test_a_message_without_a_method_returns_nothing(self):
-        self.assertIsNone(mcp.handle_message({'jsonrpc': '2.0', 'id': 1}, self.client, self.config))
+    def test_a_message_with_an_id_but_no_method_is_an_invalid_request(self):
+        response = mcp.handle_message({'jsonrpc': '2.0', 'id': 1}, self.client, self.config)
+        self.assertEqual(response['error']['code'], -32600)
+        self.assertEqual(response['id'], 1)
+
+    def test_a_message_with_nor_id_nor_method_is_treated_as_a_notification(self):
+        self.assertIsNone(mcp.handle_message({'jsonrpc': '2.0', 'params': {}},
+                                             self.client, self.config))
 
     def test_initialize_echoes_a_supported_protocol_version(self):
         response = mcp.handle_message(
@@ -854,7 +1106,7 @@ class HealthPayloadTests(unittest.TestCase):
         self.assertEqual(set(payload), {'status', 'server', 'version',
                                         'read_only', 'tag_tools'})
         self.assertEqual(payload['status'], 'ok')
-        self.assertEqual(payload['version'], '1.0.0')
+        self.assertEqual(payload['version'], mcp.VERSION)
         self.assertFalse(payload['read_only'])
         self.assertFalse(payload['tag_tools'])
 
@@ -922,8 +1174,19 @@ class HttpEndToEndTests(unittest.TestCase):
         self.addCleanup(self.mcp_server.server_close)
         self.port = self.mcp_server.server_address[1]
 
-    def get(self, route):
-        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+    def start_mcp_server(self, **env):
+        """Start a second MCP server with its own environment overrides."""
+        config = make_config(
+            NEXTCLOUD_MCP_BASE_URL=f'http://127.0.0.1:{self.nc_server.server_address[1]}', **env)
+        server = mcp.build_server(('127.0.0.1', 0), config)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server.server_address[1]
+
+    def get(self, route, port=None):
+        connection = http.client.HTTPConnection('127.0.0.1', port or self.port, timeout=5)
         try:
             connection.request('GET', route)
             response = connection.getresponse()
@@ -932,13 +1195,14 @@ class HttpEndToEndTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def post(self, message, authorization='Basic dGVzdDp0ZXN0'):
-        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+    def post(self, message, authorization='Basic dGVzdDp0ZXN0', headers=None, port=None):
+        connection = http.client.HTTPConnection('127.0.0.1', port or self.port, timeout=5)
         try:
-            headers = {'Content-Type': 'application/json'}
+            request_headers = {'Content-Type': 'application/json'}
             if authorization is not None:
-                headers['Authorization'] = authorization
-            connection.request('POST', '/mcp', body=json.dumps(message), headers=headers)
+                request_headers['Authorization'] = authorization
+            request_headers.update(headers or {})
+            connection.request('POST', '/mcp', body=json.dumps(message), headers=request_headers)
             response = connection.getresponse()
             body = response.read()
             return response.status, (json.loads(body) if body else None)
@@ -949,7 +1213,7 @@ class HttpEndToEndTests(unittest.TestCase):
         status, payload = self.get('/healthz')
         self.assertEqual(status, 200)
         self.assertEqual(payload, {'status': 'ok', 'server': 'nextcloud',
-                                   'version': '1.0.0', 'read_only': False,
+                                   'version': mcp.VERSION, 'read_only': False,
                                    'tag_tools': False})
 
     def test_a_request_without_authorization_is_refused(self):
@@ -995,6 +1259,49 @@ class HttpEndToEndTests(unittest.TestCase):
         status, body = self.post([{'jsonrpc': '2.0', 'id': 1, 'method': 'ping'}])
         self.assertEqual(status, 400)
         self.assertEqual(body['error']['code'], -32600)
+
+    def test_a_message_with_an_id_but_no_method_answers_minus_32600(self):
+        status, body = self.post({'jsonrpc': '2.0', 'id': 11})
+        self.assertEqual(status, 200)
+        self.assertEqual(body['error']['code'], -32600)
+        self.assertEqual(body['id'], 11)
+
+    def test_a_rejected_credential_is_a_tool_error_not_an_http_401(self):
+        FakeNextcloudServer.fail_whoami = True
+        status, body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                  'params': {'name': 'nextcloud_whoami', 'arguments': {}}})
+        self.assertEqual(status, 200)
+        self.assertTrue(body['result']['isError'])
+        self.assertIn('401', body['result']['content'][0]['text'])
+
+    def test_an_origin_matching_the_host_is_allowed(self):
+        status, _body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'ping'},
+                                  headers={'Origin': f'http://127.0.0.1:{self.port}'})
+        self.assertEqual(status, 200)
+
+    def test_an_origin_from_another_host_is_refused(self):
+        status, body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'ping'},
+                                 headers={'Origin': 'http://evil.example'})
+        self.assertEqual(status, 403)
+        self.assertIn('origin', body['error'])
+
+    def test_a_request_without_an_origin_is_still_allowed(self):
+        status, _body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'ping'})
+        self.assertEqual(status, 200)
+
+    def test_an_allowlisted_origin_is_accepted_even_when_it_differs_from_host(self):
+        port = self.start_mcp_server(
+            NEXTCLOUD_MCP_ALLOWED_ORIGINS='https://allowed.example')
+        status, _body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'ping'},
+                                  headers={'Origin': 'https://allowed.example'}, port=port)
+        self.assertEqual(status, 200)
+
+    def test_an_origin_outside_the_allowlist_is_refused(self):
+        port = self.start_mcp_server(
+            NEXTCLOUD_MCP_ALLOWED_ORIGINS='https://allowed.example')
+        status, _body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'ping'},
+                                  headers={'Origin': 'https://evil.example'}, port=port)
+        self.assertEqual(status, 403)
 
 
 class StandardLibraryOnlyTests(unittest.TestCase):
@@ -1048,12 +1355,45 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertIn('cap_drop: [ALL]', compose)
         self.assertIn('restart: unless-stopped', compose)
 
+    def test_the_compose_stores_the_scratch_dir_on_a_named_volume(self):
+        compose = read('compose.yaml')
+        self.assertIn('- nextcloud-mcp-tmp:/var/tmp/nextcloud-mcp', compose)
+        self.assertIn('nextcloud-mcp-tmp:', compose)
+        self.assertIn('tmpfs:', compose)
+        self.assertIn('- /tmp', compose)
+
     def test_the_ci_workflow_tests_and_builds(self):
         ci = read('.github/workflows/ci.yml')
-        self.assertIn("python-version: '3.13'", ci)
+        self.assertIn("python-version: ['3.10', '3.11', '3.12', '3.13']", ci)
+        self.assertIn('ruff check', ci)
         self.assertIn('python3 -m unittest discover -s tests -v', ci)
         self.assertIn('py_compile', ci)
         self.assertIn('docker build', ci)
+
+    def test_the_image_workflow_publishes_multi_arch_on_version_tags(self):
+        image = read('.github/workflows/image.yml')
+        self.assertIn("tags: ['v*']", image)
+        self.assertIn('packages: write', image)
+        self.assertIn('docker/login-action', image)
+        self.assertIn('docker/build-push-action', image)
+        self.assertIn('linux/amd64,linux/arm64', image)
+        self.assertIn('ghcr.io/ruruthegeek/nextcloud-mcp:latest', image)
+
+    def test_dependabot_watches_github_actions_weekly(self):
+        dependabot = read('.github/dependabot.yml')
+        self.assertIn('package-ecosystem: github-actions', dependabot)
+        self.assertIn('interval: weekly', dependabot)
+
+    def test_the_security_policy_points_at_github_advisories(self):
+        security = read('SECURITY.md')
+        self.assertIn('GitHub Security Advisories', security)
+        self.assertIn('security/advisories/new', security)
+        self.assertIn('Scope', security)
+
+    def test_the_ruff_lint_configuration_selects_the_documented_rules(self):
+        ruff = read('pyproject.toml')
+        self.assertIn('line-length', ruff)
+        self.assertIn("['E', 'F', 'W', 'I']", ruff)
 
     def test_the_license_is_the_agpl(self):
         self.assertIn('GNU AFFERO GENERAL PUBLIC LICENSE', read('LICENSE'))
@@ -1064,8 +1404,9 @@ class RepositoryHygieneTests(unittest.TestCase):
         # Assembled at runtime so this test file does not match itself.
         forbidden = ['apex' + 'tox', '192' + '.168.', 'shake' + '-cloud',
                      '/home/' + 'ruru']
+        skipped = {'.git', '__pycache__', '.ruff_cache', '.mypy_cache', '.pytest_cache'}
         for path in sorted(ROOT.rglob('*')):
-            if not path.is_file() or '.git' in path.parts or '__pycache__' in path.parts:
+            if not path.is_file() or skipped.intersection(path.parts):
                 continue
             text = path.read_text(encoding='utf-8', errors='ignore')
             for pattern in forbidden:

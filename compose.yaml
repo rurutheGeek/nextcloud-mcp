@@ -15,11 +15,14 @@ services:
       # loopback is published.
       - '127.0.0.1:5811:5811'
     restart: unless-stopped
-    # The server keeps no state on disk: archive work goes to the tmpfs below.
+    # The server keeps no state on disk: /tmp is a tmpfs. NEXTCLOUD_MCP_TMP
+    # (archive downloads/extractions) uses a named volume on purpose: it can
+    # hold multi-GB archives and must not eat RAM.
     read_only: true
     tmpfs:
       - /tmp
-      - /var/tmp/nextcloud-mcp
+    volumes:
+      - nextcloud-mcp-tmp:/var/tmp/nextcloud-mcp
     cap_drop: [ALL]
     security_opt: ['no-new-privileges:true']
     healthcheck:
@@ -28,3 +31,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 10s
+
+volumes:
+  nextcloud-mcp-tmp:

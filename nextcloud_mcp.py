@@ -18,6 +18,7 @@ Configuration (environment variables):
   NEXTCLOUD_MCP_TAG_API_TOKEN     shared secret (empty disables the tag tools)
   NEXTCLOUD_MCP_MUSIC_ROOT        default /music
   NEXTCLOUD_MCP_WRITE_DENY        extra comma-separated write-deny prefixes
+  NEXTCLOUD_MCP_ALLOWED_ORIGINS   comma-separated Origin allow-list (optional)
   NEXTCLOUD_MCP_TMP               default /var/tmp/nextcloud-mcp
   NEXTCLOUD_MCP_READ_ONLY         default 0 (1 hides every write tool)
   NEXTCLOUD_MCP_MAX_READ_BYTES    default 256 KiB
@@ -48,7 +49,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 SERVER_NAME = 'nextcloud'
 USER_AGENT = ('nextcloud-mcp/' + VERSION +
               ' (+https://github.com/rurutheGeek/nextcloud-mcp)')
@@ -124,6 +125,9 @@ class Config:
             (self.music_root + '/Converted',) +
             tuple('/' + prefix.strip().strip('/') for prefix in
                   env.get('NEXTCLOUD_MCP_WRITE_DENY', '').split(',') if prefix.strip()))
+        self.allowed_origins = tuple(
+            origin.strip().rstrip('/') for origin in
+            env.get('NEXTCLOUD_MCP_ALLOWED_ORIGINS', '').split(',') if origin.strip())
         self.tmp = Path(env.get('NEXTCLOUD_MCP_TMP', '/var/tmp/nextcloud-mcp'))
         self.read_only = env.get('NEXTCLOUD_MCP_READ_ONLY', '0').strip().lower() not in ('', '0', 'false', 'no')
         self.max_read_bytes = int(env.get('NEXTCLOUD_MCP_MAX_READ_BYTES', str(256 * 1024)))
@@ -165,12 +169,19 @@ def normalize_dav_path(raw, label='path'):
 
 
 def ensure_write_allowed(path, config=None):
-    """Refuse writes to protected areas (conversion originals by default)."""
+    """Refuse writes to protected areas and to their ancestors.
+
+    A deny prefix protects the prefix itself and everything below it; writing
+    to one of its ancestors would take the protected subtree with it (moving,
+    deleting or extracting over it), so ancestors are refused as well.
+    """
     prefixes = config.write_deny_prefixes if config is not None else WRITE_DENY_PREFIXES
-    lowered = path.lower()
+    lowered = path.lower().rstrip('/')
     for prefix in prefixes:
-        if lowered == prefix.lower() or lowered.startswith(prefix.lower() + '/'):
-            raise ToolError(f'{prefix} is read-only (conversion originals)')
+        denied = prefix.lower().rstrip('/')
+        if not denied or lowered == denied or lowered.startswith(denied + '/') \
+                or denied.startswith(lowered + '/'):
+            raise ToolError(f'{prefix} is read-only (write-deny prefix)')
 
 
 def music_relative_path(path, music_root='/music'):
@@ -517,11 +528,20 @@ def list_archive_file(archive_path, kind, max_members):
     return members
 
 
-def extract_archive_file(archive_path, kind, destination, config):
-    """Extract an archive into a temporary directory; return (files, totals)."""
+def extract_archive_file(archive_path, kind, destination, config, member_guard=None):
+    """Extract an archive into a temporary directory; return (files, totals).
+
+    `member_guard`, when given, is called with every normalized member name
+    before that member is extracted (a caller-side policy hook; it may raise
+    ToolError to refuse the whole archive).
+    """
     destination = Path(destination)
     extracted = []
     total = {'files': 0, 'bytes': 0}
+
+    def guard(name):
+        if member_guard is not None:
+            member_guard(name)
 
     def reserve(size):
         total['files'] += 1
@@ -539,6 +559,7 @@ def extract_archive_file(archive_path, kind, destination, config):
         with zipfile.ZipFile(archive_path) as archive:
             for info in archive.infolist():
                 name = safe_member_name(info.filename)
+                guard(name)
                 mode = info.external_attr >> 16
                 if stat.S_ISLNK(mode):
                     raise ToolError(f'Refusing to extract an archive containing a symbolic link: {name}')
@@ -553,6 +574,7 @@ def extract_archive_file(archive_path, kind, destination, config):
         with tarfile.open(archive_path) as archive:
             for member in archive:
                 name = safe_member_name(member.name)
+                guard(name)
                 if member.issym() or member.islnk():
                     raise ToolError(f'Refusing to extract an archive containing a link: {name}')
                 if member.isdir():
@@ -649,7 +671,12 @@ def tool_read_file(client, config, args):
     encoding = args.get('encoding') or 'auto'
     if encoding not in ('auto', 'text', 'base64'):
         raise ToolError('encoding must be one of auto / text / base64')
-    max_bytes = min(int(args.get('max_bytes') or config.max_read_bytes), config.max_read_bytes)
+    requested = args.get('max_bytes')
+    if requested is None:
+        requested = config.max_read_bytes
+    elif isinstance(requested, bool) or not isinstance(requested, int):
+        raise ToolError('max_bytes must be an integer')
+    max_bytes = max(1, min(requested, config.max_read_bytes))
     data, truncated, content_type, etag = client.read_file(path, max_bytes)
     if encoding == 'auto':
         suffix = posixpath.splitext(path)[1].lower()
@@ -674,6 +701,7 @@ def tool_search_files(client, config, args):
 def tool_read_music_tags(client, config, args):
     path = normalize_dav_path(args.get('path'), 'path')
     relative = music_relative_path(path, config.music_root)
+    client.stat(path)
     result = TagApiClient(config)._request('GET', '/tags', {'path': relative})
     # The tag API answers with a library-relative path; return the absolute
     # path the caller passed so every tool keeps the same path convention.
@@ -691,6 +719,9 @@ def tool_search_musicbrainz(client, config, args):
 def tool_list_archive(client, config, args):
     path = normalize_dav_path(args.get('path'), 'path')
     kind = archive_kind(path)
+    info = client.stat(path)
+    if isinstance(info.get('size'), int) and info['size'] > config.max_zip_bytes:
+        raise ToolError(f'The archive is larger than the limit ({config.max_zip_bytes} bytes)')
     workdir = Path(tempfile.mkdtemp(dir=config.tmp, prefix='list-'))
     try:
         local = workdir / 'archive'
@@ -758,6 +789,7 @@ def tool_move_file(client, config, args):
 def tool_copy_file(client, config, args):
     path = normalize_dav_path(args.get('path'), 'path')
     destination = normalize_dav_path(args.get('destination'), 'destination')
+    ensure_write_allowed(path, config)
     ensure_write_allowed(destination, config)
     return {'path': path, 'destination': destination,
             **client.copy(path, destination, overwrite=args.get('overwrite') is not False)}
@@ -831,6 +863,9 @@ def tool_create_zip(client, config, args):
         local_files = []
         total = 0
         for name, remote in items:
+            info = client.stat(remote)
+            if isinstance(info.get('size'), int) and total + info['size'] > config.max_zip_bytes:
+                raise ToolError('The total size of the zip exceeds the limit')
             local = workdir / 'files' / name
             local.parent.mkdir(parents=True, exist_ok=True)
             with open(local, 'wb') as out:
@@ -864,7 +899,9 @@ def tool_extract_archive(client, config, args):
             client.download_to(path, out, timeout=config.archive_timeout)
         destination = workdir / 'out'
         destination.mkdir()
-        extracted, total = extract_archive_file(local, kind, destination, config)
+        extracted, total = extract_archive_file(
+            local, kind, destination, config,
+            member_guard=lambda name: ensure_write_allowed(posixpath.join(target, name), config))
         client.create_folder(target)
         directories = set()
         files = []
@@ -884,6 +921,7 @@ def tool_extract_archive(client, config, args):
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     if args.get('remove_archive'):
+        ensure_write_allowed(path, config)
         client.delete(path)
     return {'path': path, 'target': target, 'kind': kind,
             'files': total['files'], 'bytes': total['bytes'],
@@ -985,8 +1023,12 @@ TOOLS = [
     Tool('nextcloud_extract_archive',
          'Extract a zip/tar into a folder (checks file count, size and path escapes).',
          schema({'path': PATH_PROP,
-                 'target': {'type': 'string', 'description': 'Destination folder. Default: a sibling folder named after the archive'},
-                 'remove_archive': {'type': 'boolean', 'description': 'true moves the archive to the trash after extracting'}},
+                 'target': {'type': 'string',
+                            'description': 'Destination folder. Default: a sibling '
+                                           'folder named after the archive'},
+                 'remove_archive': {'type': 'boolean',
+                                    'description': 'true moves the archive to the '
+                                                   'trash after extracting'}},
                 ['path']),
          tool_extract_archive, write=True, destructive=True),
 ]
@@ -1027,14 +1069,18 @@ def tool_result(payload, is_error=False):
 
 
 def call_tool(name, args, client, config):
-    # Unknown tool names, write attempts on a read-only server, disabled tag
-    # tools and bad arguments are reported as tool errors here, together with
-    # failures raised by the handler itself. The HTTP layer (do_POST) does not
-    # turn exceptions into JSON-RPC errors, so an uncaught ToolError would kill
-    # the request thread instead of answering the client.
+    # The caller is verified against Nextcloud (whoami) before anything else,
+    # so a rejected or revoked credential becomes a tool error (HTTP 401/403
+    # included) instead of reaching a handler. Unknown tool names, write
+    # attempts on a read-only server, disabled tag tools and bad arguments are
+    # reported as tool errors here, together with failures raised by the
+    # handler itself. The HTTP layer (do_POST) does not turn exceptions into
+    # JSON-RPC errors, so an uncaught ToolError would kill the request thread
+    # instead of answering the client.
     started = time.monotonic()
     user = 'unknown'
     try:
+        user = client.whoami()['id']
         tool = TOOLS_BY_NAME.get(name)
         if tool is None:
             raise ToolError(f'Unknown tool: {name}')
@@ -1045,10 +1091,6 @@ def call_tool(name, args, client, config):
                             'NEXTCLOUD_MCP_TAG_API_URL and NEXTCLOUD_MCP_TAG_API_TOKEN')
         if not isinstance(args, dict):
             raise ToolError('arguments must be a JSON object')
-        try:
-            user = client.whoami()['id']
-        except Exception:  # noqa: BLE001 - logging only; keep going on failure
-            pass
         result = tool.handler(client, config, args)
     except ToolError as error:
         log.info('tool=%s user=%s error=%s duration=%.1fs', name, user, error, time.monotonic() - started)
@@ -1067,6 +1109,8 @@ def handle_message(message, client, config):
     method = message.get('method')
     message_id = message.get('id')
     if not method:
+        if 'id' in message:
+            return jsonrpc_error(message_id, -32600, 'Invalid Request: method is required')
         return None
     if message_id is None:
         return None
@@ -1120,6 +1164,25 @@ class McpHandler(BaseHTTPRequestHandler):
     def _authorization(self):
         return self.headers.get('Authorization') or ''
 
+    def _origin_allowed(self):
+        """Check the Origin header (DNS-rebinding protection).
+
+        With NEXTCLOUD_MCP_ALLOWED_ORIGINS set, a present Origin must match one
+        of the configured origins exactly. Without it, a present Origin must be
+        the same origin as the request's Host header. Requests without an
+        Origin header (server-to-server MCP clients) are allowed.
+        """
+        origin = self.headers.get('Origin')
+        if not origin:
+            return True
+        allowed = self.server.config.allowed_origins
+        if allowed:
+            normalized = origin.strip().rstrip('/').lower()
+            return any(normalized == item.lower() for item in allowed)
+        parsed = urllib.parse.urlsplit(origin)
+        host = self.headers.get('Host') or ''
+        return bool(parsed.netloc) and parsed.netloc.lower() == host.lower()
+
     def do_GET(self):
         route = urllib.parse.urlparse(self.path).path
         if route == '/healthz':
@@ -1142,6 +1205,9 @@ class McpHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if urllib.parse.urlparse(self.path).path != '/mcp':
             self._send_json(404, {'error': 'not found'})
+            return
+        if not self._origin_allowed():
+            self._send_json(403, {'error': 'origin not allowed'})
             return
         authorization = self._authorization()
         if not authorization:
