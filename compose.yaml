@@ -1,0 +1,30 @@
+# Nextcloud MCP server: pass-through AI-agent access to Nextcloud with the
+# caller's own credentials and ACLs. Standard library only.
+#
+# The container listens on 5811 and publishes the host loopback only. Put a
+# reverse proxy in front of it and never expose it directly.
+name: nextcloud-mcp
+
+services:
+  nextcloud-mcp:
+    build: .
+    image: ghcr.io/ruruthegeek/nextcloud-mcp:latest
+    env_file: .env
+    ports:
+      # NEXTCLOUD_MCP_BIND is 0.0.0.0 inside the container; only the host
+      # loopback is published.
+      - '127.0.0.1:5811:5811'
+    restart: unless-stopped
+    # The server keeps no state on disk: archive work goes to the tmpfs below.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp/nextcloud-mcp
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5811/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
