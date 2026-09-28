@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-28
+
+### Added
+
+- Calendar tools: `nextcloud_list_calendars`, `nextcloud_list_events` and
+  `nextcloud_create_event`, speaking CalDAV as the connecting user so calendar
+  sharing and read-only privileges keep applying. Calendars that do not accept
+  `VEVENT` and read-only calendars are refused for new events.
+- `nextcloud_create_event` expands recurring series (`DAILY`, `WEEKLY`,
+  `MONTHLY`, `YEARLY` with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`,
+  `BYMONTH`, `EXDATE` and `RECURRENCE-ID` overrides), skips
+  `TRANSP:TRANSPARENT` / `STATUS:CANCELLED` events and refuses a time that
+  overlaps an existing busy event unless `allow_overlap=true` (the refusal
+  lists the conflicting events, so an agent can skip conflicting candidates).
+- A clear error when the Nextcloud Calendar app is missing: the calendar tools
+  check the `calendar` capability on `/ocs/v2.php/cloud/capabilities`.
+- `NEXTCLOUD_MCP_TIMEZONE` (default: the host's local timezone) for times
+  without an offset, all-day events and the default listing range.
+
+### Changed
+
+- README documents the calendar tools, their overlap semantics, recurrence
+  support and the new configuration (English and Japanese).
+
 ## [1.0.1] - 2026-09-26
 
 ### Security

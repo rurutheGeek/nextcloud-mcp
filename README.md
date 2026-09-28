@@ -1,10 +1,10 @@
 # Nextcloud MCP server
 
 A small [MCP](https://modelcontextprotocol.io/) server that lets AI agents
-(opencode, Claude, ...) read and write your Nextcloud files, edit MP3 tags and
-pack or unpack archives — **as the connecting user**. It implements the
-Streamable HTTP transport (`POST /mcp`) with the Python standard library only:
-no dependencies, no database, no state.
+(opencode, Claude, ...) read and write your Nextcloud files, edit MP3 tags,
+pack or unpack archives and manage CalDAV calendar events — **as the
+connecting user**. It implements the Streamable HTTP transport (`POST /mcp`)
+with the Python standard library only: no dependencies, no database, no state.
 
 ## What it does
 
@@ -12,6 +12,12 @@ no dependencies, no database, no state.
   move/rename, copy, delete (to the Nextcloud trash).
 - **Archives**: list zip/tar contents, create a zip from files/folders, extract
   a zip/tar with file-count, size, symlink and path-escape checks.
+- **Calendars**: list the caller's calendars, list events in a time range
+  (recurring events expanded), and create events that are refused when they
+  overlap an existing busy event unless `allow_overlap=true`. CalDAV follows
+  the caller's own calendar collections and sharing privileges. If the
+  Nextcloud Calendar app is missing, the tools answer a clear error instead of
+  a generic failure.
 - **Music tags**: read/write ID3 tags and query MusicBrainz, through an
   optional tag API bridge (disabled unless configured).
 
@@ -56,6 +62,8 @@ Read tools:
 | `nextcloud_read_music_tags` | ID3 tags of an `.mp3` under the music root. Tag tools only. |
 | `nextcloud_search_musicbrainz` | MusicBrainz recording candidates. Tag tools only. |
 | `nextcloud_list_archive` | Zip/tar member list before extracting. |
+| `nextcloud_list_calendars` | Calendars of the account (id, name, color, writable, components). |
+| `nextcloud_list_events` | Events overlapping a time range (recurring events expanded). |
 
 Write tools:
 
@@ -69,10 +77,30 @@ Write tools:
 | `nextcloud_write_music_tags` | Write ID3 tags; the tag API keeps a backup. Tag tools only. |
 | `nextcloud_create_zip` | Pack files/folders into a zip on Nextcloud. |
 | `nextcloud_extract_archive` | Extract a zip/tar into a folder. |
+| `nextcloud_create_event` | Create a VEVENT; refuses overlaps unless `allow_overlap=true`. |
 
 The three "tag tools only" entries are hidden from `tools/list` and answer a
 clear error while the tag API is not configured. With
 `NEXTCLOUD_MCP_READ_ONLY=1` every write tool is hidden and refused.
+
+Calendar notes:
+
+- `nextcloud_list_calendars` needs the Nextcloud Calendar app. When the
+  `calendar` capability is missing from `/ocs/v2.php/cloud/capabilities`, the
+  calendar tools answer that the Calendar app (extension) is not available,
+  instead of a generic CalDAV failure.
+- Calendar ids are the CalDAV collection names (`personal`, a UUID, ...).
+  Event tools accept an id or a display name, and only calendars that accept
+  `VEVENT` and are writable can receive events.
+- `nextcloud_create_event` checks the target range for busy events (recurring
+  series are expanded, overrides and `EXDATE` applied, `TRANSP:TRANSPARENT` and
+  `STATUS:CANCELLED` skipped) and refuses to create an overlapping event unless
+  `allow_overlap=true`; the refusal lists the conflicting events.
+- Times are ISO 8601. Offsets are kept as given and stored as UTC; times
+  without an offset, all-day events and the default listing range use
+  `NEXTCLOUD_MCP_TIMEZONE` (default: the host's local timezone). Recurrence
+  rules are expanded for `DAILY`, `WEEKLY`, `MONTHLY` and `YEARLY`; other
+  frequencies are reported as a warning and not expanded.
 
 Each tool carries the JSON Schema returned as `inputSchema` by `tools/list`.
 `outputSchema`/`structuredContent` are **not implemented**: results are
@@ -89,6 +117,7 @@ stable; they are not changed between minor versions.
 | `NEXTCLOUD_MCP_TAG_API_URL` | *(empty)* | Tag API base URL. The tag tools need this **and** the token. |
 | `NEXTCLOUD_MCP_TAG_API_TOKEN` | *(empty)* | Tag API bearer token. |
 | `NEXTCLOUD_MCP_MUSIC_ROOT` | `/music` | Music root (DAV path). Limits the MP3 tag tools and defines `{root}/Converted`. |
+| `NEXTCLOUD_MCP_TIMEZONE` | *(empty)* | IANA timezone for calendar times without an offset, all-day events and the default listing range. Empty uses the host's local timezone. |
 | `NEXTCLOUD_MCP_WRITE_DENY` | *(empty)* | Extra write-deny prefixes, comma-separated absolute paths. Their ancestors are refused too. |
 | `NEXTCLOUD_MCP_ALLOWED_ORIGINS` | *(empty)* | Origin allow-list, comma-separated (for example `https://nextcloud-mcp.example.net`). Recommended for browser clients. |
 | `NEXTCLOUD_MCP_TMP` | `/var/tmp/nextcloud-mcp` | Scratch directory for archive downloads/extractions. Use disk (or a named volume), not tmpfs. |
@@ -103,7 +132,7 @@ stable; they are not changed between minor versions.
 | `NEXTCLOUD_MCP_ARCHIVE_TIMEOUT` | `1800` | Timeout in seconds for archive downloads/uploads. |
 
 `GET /healthz` returns
-`{"status":"ok","server":"nextcloud","version":"1.0.1","read_only":false,"tag_tools":false}`.
+`{"status":"ok","server":"nextcloud","version":"1.1.0","read_only":false,"tag_tools":false}`.
 
 ## Running with Docker
 
@@ -287,20 +316,38 @@ validation, and real HTTP round trips against fake Nextcloud/tag API servers.
 
 ## Future work
 
+- **Calendar updates and deletions** (`nextcloud_update_event` /
+  `nextcloud_delete_event`) and free/busy-aware suggestions.
 - **stdio / `uvx` transport** for local, single-user agents (no reverse proxy).
 - **OAuth** so MCP clients can obtain per-user tokens instead of forwarding
   Basic credentials, and a per-user tag API ACL.
 
-Both are out of scope for 1.x; HTTP + Basic/app password is the supported
-transport today.
+Calendar write support is create-only in 1.1; the other items are out of scope
+for 1.x. HTTP + Basic/app password is the supported transport today.
 
 ## 日本語の概要
 
 Nextcloud MCPサーバーは、AIエージェント（opencode等）にNextcloudの
-ファイル操作・MP3タグ編集・圧縮/解凍をMCPツールとして渡す、標準ライブラリ
-だけで動く小さなサーバーです。呼び出し元が送った `Authorization` ヘッダーを
-そのままNextcloudへ転送するので、権限・共有・クォータ・ゴミ箱はすべて
-Nextcloud側のACLに従い、サーバーは資格情報を保存しません。
+ファイル操作・MP3タグ編集・圧縮/解凍・カレンダー予定の一覧/追加をMCPツール
+として渡す、標準ライブラリだけで動く小さなサーバーです。呼び出し元が送った
+`Authorization` ヘッダーをそのままNextcloudへ転送するので、権限・共有・
+クォータ・ゴミ箱はすべてNextcloud側のACLに従い、サーバーは資格情報を保存
+しません。
+
+カレンダーは `nextcloud_list_calendars`・`nextcloud_list_events`・
+`nextcloud_create_event` の3ツールです。CalDAVのカレンダーは呼び出し元
+自身のコレクションと共有権限に従い、`VEVENT` を受け取れて書き込み可能な
+カレンダーにだけ予定を追加できます。Nextcloudのカレンダー拡張（Calendar
+アプリ）が有効でない場合（`/ocs/v2.php/cloud/capabilities` に `calendar` が
+無い場合）は、汎用の失敗ではなく「Calendarアプリが有効ではない」と明確な
+エラーを返します。`nextcloud_create_event` は指定時間帯の既存予定（繰り返し
+予定は展開し、上書き・EXDATE・`TRANSP:TRANSPARENT`・`STATUS:CANCELLED` を
+考慮）と重なる場合、かぶった予定を列挙して追加を拒否します。`allow_overlap=true`
+で強制追加でき、かぶりを避けたいAIは候補ごとに1件ずつ試してスキップできます。
+時刻はISO 8601で、オフセット付きはUTCとして保存、オフセット無し・終日予定・
+一覧の既定範囲は `NEXTCLOUD_MCP_TIMEZONE`（既定はホストのローカルタイム）を
+使います。繰り返し規則は `DAILY`・`WEEKLY`・`MONTHLY`・`YEARLY` を展開し、
+それ以外は警告として報告します。
 
 タグ編集ツール（`nextcloud_read_music_tags`・`nextcloud_search_musicbrainz`・
 `nextcloud_write_music_tags`）は `NEXTCLOUD_MCP_TAG_API_URL` と
@@ -317,6 +364,9 @@ Nextcloud側のACLに従い、サーバーは資格情報を保存しません�
 ダウンロード前サイズ検査、`Origin` 検証（`NEXTCLOUD_MCP_ALLOWED_ORIGINS`）を
 追加しました。タグAPIは共有ライブラリを直接書き換えるため、当面は単一
 ユーザー運用が前提です。アプリパスワードの利用を推奨します。
+
+1.1.0ではカレンダー3ツールを追加しました。カレンダー書き込みは追加のみで、
+更新・削除は今後の対応です。
 
 想定配備はDocker（`compose.yaml`、ホストの `127.0.0.1:5811` のみ公開）か
 systemdユニットで、どちらも前段にHTTPSリバースプロキシを置く前提です。

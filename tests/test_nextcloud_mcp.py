@@ -25,6 +25,7 @@ import unittest
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -530,15 +531,438 @@ class ToolCatalogTests(unittest.TestCase):
                 self.assertIn(required, tool.schema['properties'], tool.name)
 
 
+def ics_event(uid, start, end, summary='Event', extra=''):
+    """Build a minimal one-VEVENT iCalendar resource for the fakes."""
+    return (f'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n'
+            f'DTSTART:{start}\r\nDTEND:{end}\r\nSUMMARY:{summary}\r\n{extra}'
+            'END:VEVENT\r\nEND:VCALENDAR\r\n')
+
+
+class IcalHelperTests(unittest.TestCase):
+    def test_continuation_lines_are_unfolded(self):
+        lines = mcp.ical_unfold('SUMMARY:hello \r\n world\r\nDTSTART:20260928T090000Z\r\n')
+        self.assertEqual(lines, ['SUMMARY:hello world', 'DTSTART:20260928T090000Z'])
+
+    def test_split_line_reads_params_and_the_value(self):
+        name, params, value = mcp.ical_split_line(
+            'DTSTART;TZID=Asia/Tokyo;VALUE=DATE-TIME:20260928T090000')
+        self.assertEqual(name, 'DTSTART')
+        self.assertEqual(params, {'TZID': 'Asia/Tokyo', 'VALUE': 'DATE-TIME'})
+        self.assertEqual(value, '20260928T090000')
+        self.assertEqual(mcp.ical_split_line('SUMMARY:a;b,c:d')[2], 'a;b,c:d')
+
+    def test_escape_and_unescape_round_trip(self):
+        for raw in ('plain', 'a, b; c\\d\nnext', 'line1\nline2'):
+            self.assertEqual(mcp.ical_unescape(mcp.ical_escape(raw)), raw)
+
+    def test_folding_splits_long_lines_at_75_octets(self):
+        folded = mcp.ical_fold('SUMMARY:' + 'x' * 100)
+        self.assertIn('\r\n ', folded)
+        for line in folded.split('\r\n'):
+            self.assertLessEqual(len(line.encode('utf-8')), 75)
+        self.assertEqual(mcp.ical_unfold(folded), ['SUMMARY:' + 'x' * 100])
+
+    def test_folding_does_not_split_a_utf8_character(self):
+        folded = mcp.ical_fold('SUMMARY:' + 'あ' * 40)
+        self.assertEqual(mcp.ical_unfold(folded), ['SUMMARY:' + 'あ' * 40])
+
+    def test_parse_moment_reads_utc_tzid_date_and_offset(self):
+        moment, all_day, assumed = mcp.parse_ical_moment({}, '20260928T090000Z', timezone.utc)
+        self.assertEqual(moment, datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc))
+        self.assertFalse(all_day)
+        self.assertFalse(assumed)
+        moment, _all_day, _assumed = mcp.parse_ical_moment(
+            {'TZID': 'Asia/Tokyo'}, '20260928T090000', timezone.utc)
+        self.assertEqual(moment.utcoffset(), timedelta(hours=9))
+        moment, all_day, _assumed = mcp.parse_ical_moment({'VALUE': 'DATE'}, '20260928', timezone.utc)
+        self.assertTrue(all_day)
+        self.assertEqual(moment.date(), date(2026, 9, 28))
+        moment, _all_day, _assumed = mcp.parse_ical_moment({}, '20260928T090000+0930', timezone.utc)
+        self.assertEqual(moment.utcoffset(), timedelta(hours=9, minutes=30))
+
+    def test_an_unknown_tzid_falls_back_to_the_default_timezone(self):
+        moment, _all_day, assumed = mcp.parse_ical_moment(
+            {'TZID': 'Mars/Olympus'}, '20260928T090000', timezone.utc)
+        self.assertTrue(assumed)
+        self.assertEqual(moment.tzinfo, timezone.utc)
+
+    def test_duration_parsing(self):
+        self.assertEqual(mcp.parse_ical_duration('PT1H30M'), timedelta(hours=1, minutes=30))
+        self.assertEqual(mcp.parse_ical_duration('P1DT2H'), timedelta(days=1, hours=2))
+        self.assertEqual(mcp.parse_ical_duration('P2W'), timedelta(weeks=2))
+        with self.assertRaises(mcp.ToolError):
+            mcp.parse_ical_duration('soon')
+
+    def test_parse_user_datetime_accepts_dates_offsets_and_naive_times(self):
+        moment, is_date = mcp.parse_user_datetime('2026-09-28', timezone.utc)
+        self.assertTrue(is_date)
+        self.assertEqual(moment.date(), date(2026, 9, 28))
+        moment, is_date = mcp.parse_user_datetime('2026-09-28T09:00:00+09:00', timezone.utc)
+        self.assertFalse(is_date)
+        self.assertEqual(moment.utcoffset(), timedelta(hours=9))
+        moment, _is_date = mcp.parse_user_datetime('2026-09-28T09:00:00Z', timezone.utc)
+        self.assertEqual(moment.tzinfo, timezone.utc)
+        moment, _is_date = mcp.parse_user_datetime('2026-09-28T09:00:00', timezone.utc)
+        self.assertEqual(moment.tzinfo, timezone.utc)
+        for bad in (None, '', 'tomorrow', 123):
+            with self.assertRaises(mcp.ToolError, msg=repr(bad)):
+                mcp.parse_user_datetime(bad, timezone.utc)
+
+
+class RruleExpansionTests(unittest.TestCase):
+    UTC = timezone.utc
+
+    def expand(self, dtstart, rrule, range_start, range_end, exdates=()):
+        return mcp.expand_rrule(dtstart, mcp.parse_rrule(rrule), list(exdates),
+                                range_start, range_end)
+
+    def test_daily_count_stops_the_series(self):
+        starts, complete = self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                       'FREQ=DAILY;COUNT=3',
+                                       datetime(2026, 9, 1, tzinfo=self.UTC),
+                                       datetime(2026, 10, 1, tzinfo=self.UTC))
+        self.assertTrue(complete)
+        self.assertEqual(starts, [datetime(2026, 9, day, 9, tzinfo=self.UTC) for day in (1, 2, 3)])
+
+    def test_weekly_byday_expands_each_weekday(self):
+        starts, _complete = self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                        'FREQ=WEEKLY;BYDAY=MO,WE;COUNT=4',
+                                        datetime(2026, 9, 1, tzinfo=self.UTC),
+                                        datetime(2026, 10, 1, tzinfo=self.UTC))
+        self.assertEqual(starts, [datetime(2026, 9, day, 9, tzinfo=self.UTC)
+                                  for day in (2, 7, 9, 14)])
+
+    def test_monthly_bymonthday_handles_negative_days(self):
+        starts, _complete = self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                        'FREQ=MONTHLY;BYMONTHDAY=-1',
+                                        datetime(2026, 9, 1, tzinfo=self.UTC),
+                                        datetime(2026, 12, 1, tzinfo=self.UTC))
+        self.assertEqual(starts, [datetime(2026, 9, 30, 9, tzinfo=self.UTC),
+                                  datetime(2026, 10, 31, 9, tzinfo=self.UTC),
+                                  datetime(2026, 11, 30, 9, tzinfo=self.UTC)])
+
+    def test_monthly_bymonthday_candidates_are_sorted(self):
+        starts, _complete = self.expand(datetime(2026, 1, 1, 9, tzinfo=self.UTC),
+                                        'FREQ=MONTHLY;BYMONTHDAY=1,31',
+                                        datetime(2026, 1, 1, tzinfo=self.UTC),
+                                        datetime(2026, 4, 1, tzinfo=self.UTC))
+        self.assertEqual(starts, [datetime(2026, 1, 1, 9, tzinfo=self.UTC),
+                                  datetime(2026, 1, 31, 9, tzinfo=self.UTC),
+                                  datetime(2026, 2, 1, 9, tzinfo=self.UTC),
+                                  datetime(2026, 3, 1, 9, tzinfo=self.UTC),
+                                  datetime(2026, 3, 31, 9, tzinfo=self.UTC)])
+
+    def test_monthly_byday_uses_the_ordinal(self):
+        starts, _complete = self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                        'FREQ=MONTHLY;BYDAY=2TU',
+                                        datetime(2026, 9, 1, tzinfo=self.UTC),
+                                        datetime(2026, 12, 1, tzinfo=self.UTC))
+        self.assertEqual(starts, [datetime(2026, 9, 8, 9, tzinfo=self.UTC),
+                                  datetime(2026, 10, 13, 9, tzinfo=self.UTC),
+                                  datetime(2026, 11, 10, 9, tzinfo=self.UTC)])
+
+    def test_yearly_repeats_on_the_start_month_and_day(self):
+        starts, _complete = self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                        'FREQ=YEARLY;COUNT=2',
+                                        datetime(2026, 9, 1, tzinfo=self.UTC),
+                                        datetime(2030, 1, 1, tzinfo=self.UTC))
+        self.assertEqual(starts, [datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                  datetime(2027, 9, 1, 9, tzinfo=self.UTC)])
+
+    def test_until_is_inclusive(self):
+        starts, _complete = self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                        'FREQ=DAILY;UNTIL=20260903T090000Z',
+                                        datetime(2026, 9, 1, tzinfo=self.UTC),
+                                        datetime(2026, 10, 1, tzinfo=self.UTC))
+        self.assertEqual(len(starts), 3)
+
+    def test_exdate_removes_an_occurrence(self):
+        exdates = [('datetime', datetime(2026, 9, 2, 9, tzinfo=self.UTC))]
+        starts, _complete = self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                        'FREQ=DAILY;COUNT=3',
+                                        datetime(2026, 9, 1, tzinfo=self.UTC),
+                                        datetime(2026, 10, 1, tzinfo=self.UTC), exdates)
+        self.assertEqual(starts, [datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                  datetime(2026, 9, 3, 9, tzinfo=self.UTC)])
+
+    def test_occurrences_before_the_range_are_counted_but_not_returned(self):
+        starts, _complete = self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC),
+                                        'FREQ=DAILY;COUNT=10',
+                                        datetime(2026, 9, 3, tzinfo=self.UTC),
+                                        datetime(2026, 9, 5, tzinfo=self.UTC))
+        self.assertEqual(starts, [datetime(2026, 9, 3, 9, tzinfo=self.UTC),
+                                  datetime(2026, 9, 4, 9, tzinfo=self.UTC)])
+
+    def test_an_unsupported_frequency_is_refused(self):
+        with self.assertRaises(mcp.ToolError):
+            self.expand(datetime(2026, 9, 1, 9, tzinfo=self.UTC), 'FREQ=HOURLY',
+                        datetime(2026, 9, 1, tzinfo=self.UTC),
+                        datetime(2026, 10, 1, tzinfo=self.UTC))
+
+
+class CalendarResourceTests(unittest.TestCase):
+    UTC = timezone.utc
+    RANGE_START = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    RANGE_END = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    def events(self, text, range_start=None, range_end=None):
+        found, warnings = mcp.resource_events(text, range_start or self.RANGE_START,
+                                              range_end or self.RANGE_END, self.UTC)
+        return found, warnings
+
+    def test_a_recurring_resource_expands_and_applies_overrides(self):
+        text = (
+            'BEGIN:VCALENDAR\r\nVERSION:2.0\r\n'
+            'BEGIN:VEVENT\r\nUID:weekly@example.com\r\n'
+            'DTSTART:20260901T090000Z\r\nDTEND:20260901T100000Z\r\n'
+            'RRULE:FREQ=WEEKLY;BYDAY=MO\r\nSUMMARY:Weekly\r\nEND:VEVENT\r\n'
+            'BEGIN:VEVENT\r\nUID:weekly@example.com\r\n'
+            'RECURRENCE-ID:20260914T090000Z\r\n'
+            'DTSTART:20260915T090000Z\r\nDTEND:20260915T100000Z\r\n'
+            'SUMMARY:Weekly (moved)\r\nEND:VEVENT\r\n'
+            'END:VCALENDAR\r\n')
+        found, warnings = self.events(text)
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(found), 1)
+        event = found[0]
+        starts = [item['start'] for item in event['instances']]
+        self.assertEqual(len(starts), 4)
+        self.assertIn(datetime(2026, 9, 15, 9, tzinfo=self.UTC), starts)
+        self.assertNotIn(datetime(2026, 9, 14, 9, tzinfo=self.UTC), starts)
+        self.assertEqual(event['rrule'], 'FREQ=WEEKLY;BYDAY=MO')
+
+    def test_an_all_day_event_uses_dates(self):
+        text = ('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:holiday@example.com\r\n'
+                'DTSTART;VALUE=DATE:20260928\r\nDTEND;VALUE=DATE:20260929\r\n'
+                'SUMMARY:Holiday\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n')
+        found, _warnings = self.events(text, datetime(2026, 9, 28, tzinfo=self.UTC),
+                                       datetime(2026, 9, 29, tzinfo=self.UTC))
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]['all_day'])
+        self.assertEqual(found[0]['instances'][0]['start'], datetime(2026, 9, 28, tzinfo=self.UTC))
+
+    def test_cancelled_and_transparent_events_are_not_busy(self):
+        text = (ics_event('cancelled@example.com', '20260928T090000Z', '20260928T100000Z',
+                          extra='STATUS:CANCELLED\r\n')
+                + ics_event('free@example.com', '20260928T090000Z', '20260928T100000Z',
+                            extra='TRANSP:TRANSPARENT\r\n'))
+        found, _warnings = self.events(text, datetime(2026, 9, 28, tzinfo=self.UTC),
+                                       datetime(2026, 9, 29, tzinfo=self.UTC))
+        self.assertEqual(len(found), 2)
+        self.assertFalse(any(event['busy'] for event in found))
+
+    def test_events_outside_the_range_are_not_returned(self):
+        text = ics_event('old@example.com', '20250101T090000Z', '20250101T100000Z')
+        found, _warnings = self.events(text)
+        self.assertEqual(found, [])
+
+    def test_an_unsupported_recurrence_is_flagged_not_fatal(self):
+        text = ics_event('weird@example.com', '20260928T090000Z', '20260928T100000Z',
+                         extra='RRULE:FREQ=HOURLY;COUNT=3\r\n')
+        found, warnings = self.events(text, datetime(2026, 9, 28, tzinfo=self.UTC),
+                                      datetime(2026, 9, 29, tzinfo=self.UTC))
+        self.assertEqual(len(found), 1)
+        self.assertTrue(any('recurrence' in warning for warning in warnings))
+
+    def test_an_unsupported_recurrence_outside_the_range_is_not_returned(self):
+        text = ics_event('weird@example.com', '20250101T090000Z', '20250101T100000Z',
+                         extra='RRULE:FREQ=HOURLY;COUNT=3\r\n')
+        found, _warnings = self.events(text)
+        self.assertEqual(found, [])
+
+    def test_moments_overlap_and_touching_intervals(self):
+        self.assertTrue(mcp.moments_overlap(datetime(2026, 9, 28, 9, tzinfo=self.UTC),
+                                            datetime(2026, 9, 28, 10, tzinfo=self.UTC),
+                                            datetime(2026, 9, 28, 9, 30, tzinfo=self.UTC),
+                                            datetime(2026, 9, 28, 11, tzinfo=self.UTC)))
+        self.assertFalse(mcp.moments_overlap(datetime(2026, 9, 28, 9, tzinfo=self.UTC),
+                                             datetime(2026, 9, 28, 10, tzinfo=self.UTC),
+                                             datetime(2026, 9, 28, 10, tzinfo=self.UTC),
+                                             datetime(2026, 9, 28, 11, tzinfo=self.UTC)))
+        point = datetime(2026, 9, 28, 9, 30, tzinfo=self.UTC)
+        self.assertTrue(mcp.moments_overlap(point, point,
+                                            datetime(2026, 9, 28, 9, tzinfo=self.UTC),
+                                            datetime(2026, 9, 28, 10, tzinfo=self.UTC)))
+        self.assertFalse(mcp.moments_overlap(point, point,
+                                             datetime(2026, 9, 28, 10, tzinfo=self.UTC),
+                                             datetime(2026, 9, 28, 11, tzinfo=self.UTC)))
+
+
+CALENDAR_HOME_XML = (
+    '<?xml version="1.0"?>'
+    '<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav"'
+    ' xmlns:ical="http://apple.com/ns/ical/" xmlns:nc="http://nextcloud.com/ns">'
+    '<d:response><d:href>/remote.php/dav/calendars/alice/</d:href>'
+    '<d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype>'
+    '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>'
+    '<d:response><d:href>/remote.php/dav/calendars/alice/personal/</d:href>'
+    '<d:propstat><d:prop><d:displayname>Personal</d:displayname>'
+    '<ical:calendar-color>#0082C9</ical:calendar-color>'
+    '<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>'
+    '<cal:supported-calendar-component-set><cal:comp name="VEVENT"/></cal:supported-calendar-component-set>'
+    '<d:current-user-privilege-set><d:privilege><d:write-content/></d:privilege>'
+    '<d:privilege><d:read/></d:privilege></d:current-user-privilege-set>'
+    '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>'
+    '<d:response><d:href>/remote.php/dav/calendars/alice/tasks/</d:href>'
+    '<d:propstat><d:prop><d:displayname>Tasks</d:displayname>'
+    '<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>'
+    '<cal:supported-calendar-component-set><cal:comp name="VTODO"/></cal:supported-calendar-component-set>'
+    '<d:current-user-privilege-set><d:privilege><d:write-content/></d:privilege>'
+    '<d:privilege><d:read/></d:privilege></d:current-user-privilege-set>'
+    '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>'
+    '<d:response><d:href>/remote.php/dav/calendars/alice/shared/</d:href>'
+    '<d:propstat><d:prop><d:displayname>Shared</d:displayname>'
+    '<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>'
+    '<d:current-user-privilege-set><d:privilege><d:read/></d:privilege>'
+    '</d:current-user-privilege-set>'
+    '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>'
+    '<d:response><d:href>/remote.php/dav/calendars/alice/personal/</d:href>'
+    '<d:propstat><d:prop><d:displayname>Deleted</d:displayname>'
+    '<d:resourcetype><d:collection/><nc:deleted-calendar/></d:resourcetype>'
+    '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>'
+    '<d:response><d:href>/remote.php/dav/calendars/alice/inbox/</d:href>'
+    '<d:propstat><d:prop><d:resourcetype><d:collection/><cal:schedule-inbox/></d:resourcetype>'
+    '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>'
+    '</d:multistatus>')
+
+
+class CalendarListParsingTests(unittest.TestCase):
+    def test_only_real_calendars_are_listed_with_their_privileges(self):
+        tree = ET.fromstring(CALENDAR_HOME_XML)
+        calendars = mcp.parse_calendar_list(tree, '/remote.php/dav/calendars/alice')
+        self.assertEqual([item['id'] for item in calendars], ['personal', 'shared', 'tasks'])
+        by_id = {item['id']: item for item in calendars}
+        self.assertTrue(by_id['personal']['writable'])
+        self.assertEqual(by_id['personal']['components'], ['VEVENT'])
+        self.assertEqual(by_id['personal']['color'], '#0082C9')
+        self.assertFalse(by_id['shared']['writable'])
+        self.assertEqual(by_id['tasks']['components'], ['VTODO'])
+
+
+class CalendarToolTests(unittest.TestCase):
+    def setUp(self):
+        self.client = FakeNextcloudClient(
+            calendars=[{'id': 'personal', 'name': 'Personal', 'color': '#0082C9',
+                        'description': '', 'components': ['VEVENT'], 'writable': True}],
+            calendar_objects={'personal': [
+                {'path': '/meeting.ics', 'etag': 'e1',
+                 'calendar_data': ics_event('meeting@example.com', '20260928T000000Z',
+                                            '20260928T010000Z', 'Meeting')},
+            ]})
+        self.config = make_config(NEXTCLOUD_MCP_TIMEZONE='Asia/Tokyo')
+
+    def test_list_calendars_returns_the_account_calendars(self):
+        result = mcp.tool_list_calendars(self.client, self.config, {})
+        self.assertEqual(result['count'], 1)
+        self.assertEqual(result['calendars'][0]['id'], 'personal')
+
+    def test_list_calendars_reports_a_missing_calendar_app(self):
+        client = FakeNextcloudClient(calendar_app=False)
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_list_calendars(client, self.config, {})
+        self.assertIn('Calendar app', str(caught.exception))
+
+    def test_list_events_returns_events_and_the_resolved_calendar(self):
+        result = mcp.tool_list_events(self.client, self.config, {
+            'calendar': 'Personal', 'from': '2026-09-28T00:00:00+09:00',
+            'to': '2026-09-29T00:00:00+09:00'})
+        self.assertEqual(result['calendar'], 'personal')
+        self.assertEqual(result['count'], 1)
+        self.assertEqual(result['events'][0]['summary'], 'Meeting')
+        self.assertEqual(result['events'][0]['start'], '2026-09-28T09:00:00+09:00')
+
+    def test_list_events_rejects_an_unknown_calendar(self):
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_list_events(self.client, self.config, {'calendar': 'nope'})
+        self.assertIn('Calendar not found', str(caught.exception))
+
+    def test_create_event_refuses_an_overlapping_busy_event(self):
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_create_event(self.client, self.config, {
+                'calendar': 'personal', 'summary': 'Standup',
+                'start': '2026-09-28T09:30:00+09:00', 'end': '2026-09-28T10:30:00+09:00'})
+        self.assertIn('overlaps', str(caught.exception))
+        self.assertEqual(self.client.put_calendar_calls, [])
+
+    def test_create_event_with_allow_overlap_stores_the_event(self):
+        result = mcp.tool_create_event(self.client, self.config, {
+            'calendar': 'personal', 'summary': 'Standup',
+            'start': '2026-09-28T09:30:00+09:00', 'end': '2026-09-28T10:30:00+09:00',
+            'allow_overlap': True, 'location': 'Room 2'})
+        self.assertTrue(result['created'])
+        self.assertEqual(len(result['overlaps']), 1)
+        self.assertEqual(len(self.client.put_calendar_calls), 1)
+        calendar_id, name, ics = self.client.put_calendar_calls[0]
+        self.assertEqual(calendar_id, 'personal')
+        self.assertTrue(name.endswith('.ics'))
+        self.assertIn('SUMMARY:Standup', ics)
+        self.assertIn('LOCATION:Room 2', ics)
+
+    def test_create_event_outside_the_conflict_succeeds(self):
+        result = mcp.tool_create_event(self.client, self.config, {
+            'calendar': 'personal', 'summary': 'Lunch',
+            'start': '2026-09-28T12:00:00+09:00', 'end': '2026-09-28T13:00:00+09:00'})
+        self.assertTrue(result['created'])
+        self.assertEqual(result['overlaps'], [])
+        self.assertEqual(result['start'], '2026-09-28T12:00:00+09:00')
+
+    def test_create_all_day_event_defaults_to_one_day(self):
+        result = mcp.tool_create_event(self.client, self.config, {
+            'calendar': 'personal', 'summary': 'Holiday', 'start': '2026-10-01'})
+        self.assertTrue(result['all_day'])
+        self.assertEqual(result['start'], '2026-10-01')
+        self.assertEqual(result['end'], '2026-10-02')
+        _calendar, _name, ics = self.client.put_calendar_calls[0]
+        self.assertIn('DTSTART;VALUE=DATE:20261001', ics)
+        self.assertIn('DTEND;VALUE=DATE:20261002', ics)
+
+    def test_create_event_refuses_a_read_only_calendar(self):
+        client = FakeNextcloudClient(
+            calendars=[{'id': 'shared', 'name': 'Shared', 'color': '',
+                        'description': '', 'components': ['VEVENT'], 'writable': False}])
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_create_event(client, self.config, {
+                'calendar': 'shared', 'summary': 'X',
+                'start': '2026-09-28T12:00:00+09:00', 'end': '2026-09-28T13:00:00+09:00'})
+        self.assertIn('cannot write', str(caught.exception))
+
+    def test_create_event_refuses_a_vtodo_calendar(self):
+        client = FakeNextcloudClient(
+            calendars=[{'id': 'tasks', 'name': 'Tasks', 'color': '',
+                        'description': '', 'components': ['VTODO'], 'writable': True}])
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_create_event(client, self.config, {
+                'calendar': 'tasks', 'summary': 'X',
+                'start': '2026-09-28T12:00:00+09:00', 'end': '2026-09-28T13:00:00+09:00'})
+        self.assertIn('does not accept events', str(caught.exception))
+
+    def test_create_event_requires_an_end_for_timed_events(self):
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_create_event(self.client, self.config, {
+                'calendar': 'personal', 'summary': 'X', 'start': '2026-09-28T12:00:00+09:00'})
+        self.assertIn('end is required', str(caught.exception))
+
+    def test_no_calendars_is_reported_with_the_calendar_app_hint(self):
+        client = FakeNextcloudClient(calendars=[])
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_list_events(client, self.config, {'calendar': 'personal'})
+        self.assertIn('Calendar app', str(caught.exception))
+
+
 class FakeNextcloudClient:
     """In-memory stand-in for NextcloudClient, keyed by normalized DAV path."""
 
-    def __init__(self, user_id='alice', files=None):
+    def __init__(self, user_id='alice', files=None, calendars=None, calendar_objects=None,
+                 calendar_app=True):
         self._user_id = user_id
         # path -> {'data': bytes, 'is_dir': bool, 'writable': bool, 'etag': str, 'fileid': str}
         self.files = files if files is not None else {}
         self.files.setdefault('/', {'is_dir': True, 'writable': True, 'etag': 'root', 'fileid': '1'})
         self.deleted = []
+        self.calendar_app = calendar_app
+        self.calendars_data = calendars if calendars is not None else []
+        self.calendar_objects_data = calendar_objects if calendar_objects is not None else {}
+        self.put_calendar_calls = []
 
     def whoami(self):
         return {'id': self._user_id, 'displayname': self._user_id}
@@ -626,6 +1050,30 @@ class FakeNextcloudClient:
 
     def search(self, term, limit=20):
         return [{'title': posixpath.basename(path), 'path': path} for path in self.files if term in path][:limit]
+
+    def calendar_app_available(self):
+        return self.calendar_app
+
+    def calendars(self):
+        if not self.calendar_app:
+            raise mcp.ToolError(mcp.CALENDAR_APP_MISSING)
+        return [dict(item) for item in self.calendars_data]
+
+    def calendar_objects(self, calendar_id, range_start, range_end):
+        result = []
+        for entry in self.calendar_objects_data.get(calendar_id, []):
+            events, _warnings = mcp.resource_events(entry['calendar_data'], range_start,
+                                                    range_end, range_start.tzinfo)
+            if events:
+                result.append(dict(entry))
+        return result
+
+    def put_calendar_object(self, calendar_id, resource_name, ics_text):
+        self.put_calendar_calls.append((calendar_id, resource_name, ics_text))
+        entry = {'path': '/' + resource_name, 'etag': 'created-etag',
+                 'calendar_data': ics_text}
+        self.calendar_objects_data.setdefault(calendar_id, []).append(entry)
+        return {'etag': 'created-etag'}
 
 
 def music_client(root='/music'):
@@ -1120,11 +1568,13 @@ class HealthPayloadTests(unittest.TestCase):
 
 
 class FakeNextcloudServer(BaseHTTPRequestHandler):
-    """A tiny stand-in for Nextcloud's whoami OCS endpoint, used over real HTTP."""
+    """A tiny stand-in for Nextcloud (whoami OCS + CalDAV), used over real HTTP."""
 
     protocol_version = 'HTTP/1.1'
     fail_whoami = False
     unreachable = False
+    calendar_app = True
+    calendar_events = []  # [{'name': ..., 'ics': ...}]
 
     def log_message(self, *args):
         pass
@@ -1141,7 +1591,58 @@ class FakeNextcloudServer(BaseHTTPRequestHandler):
                 return
             self._ocs(200, {'id': 'alice', 'displayname': 'Alice'})
             return
+        if self.path.startswith('/ocs/v2.php/cloud/capabilities'):
+            capabilities = {'calendar': {'webui': True}} if type(self).calendar_app else {'dav': {}}
+            self._ocs(200, {'version': {'major': 31}, 'capabilities': capabilities})
+            return
         self.send_response(404)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def do_PROPFIND(self):
+        prefix = '/remote.php/dav/calendars/alice'
+        if not self.path.startswith(prefix + '/') and self.path.rstrip('/') != prefix:
+            self.send_response(404)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        parts = [
+            f'<d:response><d:href>{prefix}/</d:href><d:propstat><d:prop>'
+            '<d:resourcetype><d:collection/></d:resourcetype></d:prop>'
+            '<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>']
+        if type(self).calendar_app:
+            parts.append(
+                f'<d:response><d:href>{prefix}/personal/</d:href><d:propstat><d:prop>'
+                '<d:displayname>Personal</d:displayname>'
+                '<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>'
+                '<d:current-user-privilege-set><d:privilege><d:write-content/></d:privilege>'
+                '<d:privilege><d:read/></d:privilege></d:current-user-privilege-set>'
+                '<cal:supported-calendar-component-set>'
+                '<cal:comp name="VEVENT"/></cal:supported-calendar-component-set>'
+                '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>')
+        self._multistatus(parts)
+
+    def do_REPORT(self):
+        parts = []
+        for item in type(self).calendar_events:
+            escaped = (item['ics'].replace('&', '&amp;').replace('<', '&lt;')
+                       .replace('>', '&gt;'))
+            parts.append(
+                '<d:response>'
+                f'<d:href>/remote.php/dav/calendars/alice/personal/{item["name"]}</d:href>'
+                '<d:propstat><d:prop>'
+                f'<d:getetag>&quot;{item["name"]}-etag&quot;</d:getetag>'
+                f'<cal:calendar-data>{escaped}</cal:calendar-data>'
+                '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>')
+        self._multistatus(parts)
+
+    def do_PUT(self):
+        length = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(length).decode('utf-8')
+        name = self.path.rsplit('/', 1)[-1]
+        type(self).calendar_events.append({'name': name, 'ics': body})
+        self.send_response(201)
+        self.send_header('ETag', '"created-etag"')
         self.send_header('Content-Length', '0')
         self.end_headers()
 
@@ -1153,12 +1654,24 @@ class FakeNextcloudServer(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _multistatus(self, parts):
+        payload = ('<?xml version="1.0"?>'
+                   '<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">'
+                   + ''.join(parts) + '</d:multistatus>').encode('utf-8')
+        self.send_response(207)
+        self.send_header('Content-Type', 'application/xml; charset=utf-8')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
 
 class HttpEndToEndTests(unittest.TestCase):
     """Drive the real McpServer over a socket against a fake Nextcloud."""
 
     def setUp(self):
         FakeNextcloudServer.fail_whoami = False
+        FakeNextcloudServer.calendar_app = True
+        FakeNextcloudServer.calendar_events = []
         self.nc_server = ThreadingHTTPServer(('127.0.0.1', 0), FakeNextcloudServer)
         self.nc_thread = threading.Thread(target=self.nc_server.serve_forever, daemon=True)
         self.nc_thread.start()
@@ -1302,6 +1815,58 @@ class HttpEndToEndTests(unittest.TestCase):
         status, _body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'ping'},
                                   headers={'Origin': 'https://evil.example'}, port=port)
         self.assertEqual(status, 403)
+
+    def test_tools_list_includes_the_calendar_tools(self):
+        status, body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
+        self.assertEqual(status, 200)
+        names = {tool['name'] for tool in body['result']['tools']}
+        for name in ('nextcloud_list_calendars', 'nextcloud_list_events',
+                     'nextcloud_create_event'):
+            self.assertIn(name, names)
+
+    def test_list_calendars_answers_clearly_without_the_calendar_app(self):
+        FakeNextcloudServer.calendar_app = False
+        status, body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                  'params': {'name': 'nextcloud_list_calendars',
+                                             'arguments': {}}})
+        self.assertEqual(status, 200)
+        self.assertTrue(body['result']['isError'])
+        self.assertIn('Calendar app', body['result']['content'][0]['text'])
+
+    def test_calendar_events_round_trip_over_http(self):
+        FakeNextcloudServer.calendar_events = [{'name': 'existing.ics', 'ics': ics_event(
+            'meeting@example.com', '20260928T000000Z', '20260928T010000Z', 'Meeting')}]
+        status, body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                  'params': {'name': 'nextcloud_create_event', 'arguments': {
+                                      'calendar': 'personal', 'summary': 'Lunch',
+                                      'start': '2026-09-28T12:00:00+09:00',
+                                      'end': '2026-09-28T13:00:00+09:00'}}})
+        self.assertEqual(status, 200)
+        self.assertFalse(body['result']['isError'], body['result'])
+        created = json.loads(body['result']['content'][0]['text'])
+        self.assertTrue(created['created'])
+        status, body = self.post({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                                  'params': {'name': 'nextcloud_list_events', 'arguments': {
+                                      'calendar': 'personal',
+                                      'from': '2026-09-28T00:00:00+09:00',
+                                      'to': '2026-09-29T00:00:00+09:00'}}})
+        listed = json.loads(body['result']['content'][0]['text'])
+        self.assertEqual({event['summary'] for event in listed['events']},
+                         {'Meeting', 'Lunch'})
+        self.assertEqual(len(FakeNextcloudServer.calendar_events), 2)
+
+    def test_create_event_over_http_refuses_an_overlap(self):
+        FakeNextcloudServer.calendar_events = [{'name': 'existing.ics', 'ics': ics_event(
+            'meeting@example.com', '20260928T000000Z', '20260928T010000Z', 'Meeting')}]
+        status, body = self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                  'params': {'name': 'nextcloud_create_event', 'arguments': {
+                                      'calendar': 'personal', 'summary': 'Standup',
+                                      'start': '2026-09-28T00:30:00Z',
+                                      'end': '2026-09-28T01:30:00Z'}}})
+        self.assertEqual(status, 200)
+        self.assertTrue(body['result']['isError'])
+        self.assertIn('overlaps', body['result']['content'][0]['text'])
+        self.assertEqual(len(FakeNextcloudServer.calendar_events), 1)
 
 
 class StandardLibraryOnlyTests(unittest.TestCase):
