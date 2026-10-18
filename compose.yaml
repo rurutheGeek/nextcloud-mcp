@@ -1,5 +1,5 @@
 # Nextcloud MCP server: pass-through AI-agent access to Nextcloud with the
-# caller's own credentials and ACLs. Standard library only.
+# caller's own credentials and ACLs. Basic (default) or OAuth 2.1.
 #
 # The container listens on 5811 and publishes the host loopback only. Put a
 # reverse proxy in front of it and never expose it directly.
@@ -23,6 +23,8 @@ services:
       - /tmp
     volumes:
       - nextcloud-mcp-tmp:/var/tmp/nextcloud-mcp
+      # OAuth client registrations and encrypted tokens (unused with basic).
+      - nextcloud-mcp-state:/var/lib/nextcloud-mcp
     cap_drop: [ALL]
     security_opt: ['no-new-privileges:true']
     healthcheck:
@@ -34,3 +36,4 @@ services:
 
 volumes:
   nextcloud-mcp-tmp:
+  nextcloud-mcp-state:

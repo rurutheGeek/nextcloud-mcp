@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Nextcloud MCP server for AI agents. Standard library only.
+"""Nextcloud MCP server for AI agents.
 
 Gives AI agents (opencode, Claude, ...) MCP tools to read and write Nextcloud
 files, edit MP3 tags, pack/unpack archives and list/create CalDAV calendar
-events. The caller's Authorization header is forwarded to Nextcloud as-is, so
+events. Every request reaches Nextcloud with the caller's own credential, so
 permissions, shares, quotas and the trash follow the caller's own Nextcloud
-ACLs. The server stores no credentials.
+ACLs.
+
+NEXTCLOUD_MCP_AUTH=basic (default) forwards the caller's Basic Authorization
+header as-is, stores nothing and needs only the standard library. oauth and
+both add the MCP OAuth 2.1 authorization flow on top of Nextcloud's built-in
+OAuth2 app (nextcloud_mcp_oauth.py, needs requirements-oauth.txt).
 
 MCP is Streamable HTTP (`POST /mcp`, one JSON-RPC message per request, no
 sessions). Only `initialize`, `ping`, `tools/list` and `tools/call` are
@@ -31,6 +36,13 @@ Configuration (environment variables):
   NEXTCLOUD_MCP_MAX_ZIP_BYTES     default 4 GiB
   NEXTCLOUD_MCP_TIMEOUT           default 120 (seconds)
   NEXTCLOUD_MCP_ARCHIVE_TIMEOUT   default 1800 (seconds)
+  NEXTCLOUD_MCP_AUTH              default basic (basic, oauth or both)
+  NEXTCLOUD_MCP_PUBLIC_URL        public HTTPS URL of this server (OAuth)
+  NEXTCLOUD_MCP_NEXTCLOUD_PUBLIC_URL  Nextcloud URL for browsers (default BASE_URL)
+  NEXTCLOUD_MCP_OAUTH_CLIENT_ID   Nextcloud OAuth2 client ID (OAuth)
+  NEXTCLOUD_MCP_OAUTH_CLIENT_SECRET  Nextcloud OAuth2 client secret (OAuth)
+  NEXTCLOUD_MCP_OAUTH_REDIRECT_URIS  allowed MCP client redirect URIs (optional)
+  NEXTCLOUD_MCP_STATE_DIR         default /var/lib/nextcloud-mcp (OAuth state)
 """
 import base64
 import calendar
@@ -56,7 +68,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 SERVER_NAME = 'nextcloud'
 USER_AGENT = ('nextcloud-mcp/' + VERSION +
               ' (+https://github.com/rurutheGeek/nextcloud-mcp)')
@@ -146,6 +158,9 @@ def normalize_music_root(raw):
     return '/' + stripped if stripped else '/'
 
 
+AUTH_MODES = ('basic', 'oauth', 'both')
+
+
 class Config:
     def __init__(self, env):
         self.port = int(env.get('NEXTCLOUD_MCP_PORT', '5811'))
@@ -172,6 +187,17 @@ class Config:
         self.max_zip_bytes = int(env.get('NEXTCLOUD_MCP_MAX_ZIP_BYTES', str(4 * 1024 ** 3)))
         self.timeout = int(env.get('NEXTCLOUD_MCP_TIMEOUT', '120'))
         self.archive_timeout = int(env.get('NEXTCLOUD_MCP_ARCHIVE_TIMEOUT', '1800'))
+        self.auth = env.get('NEXTCLOUD_MCP_AUTH', 'basic').strip().lower() or 'basic'
+        if self.auth not in AUTH_MODES:
+            raise ValueError(f'NEXTCLOUD_MCP_AUTH must be one of {", ".join(AUTH_MODES)}')
+        self.public_url = env.get('NEXTCLOUD_MCP_PUBLIC_URL', '').strip().rstrip('/')
+        self.nextcloud_public_url = (env.get('NEXTCLOUD_MCP_NEXTCLOUD_PUBLIC_URL', '').strip().rstrip('/')
+                                     or self.base_url)
+        self.oauth_client_id = env.get('NEXTCLOUD_MCP_OAUTH_CLIENT_ID', '').strip()
+        self.oauth_client_secret = env.get('NEXTCLOUD_MCP_OAUTH_CLIENT_SECRET', '').strip()
+        self.oauth_redirect_uris = tuple(
+            uri.strip() for uri in env.get('NEXTCLOUD_MCP_OAUTH_REDIRECT_URIS', '').split(',') if uri.strip())
+        self.state_dir = Path(env.get('NEXTCLOUD_MCP_STATE_DIR', '/var/lib/nextcloud-mcp'))
 
     @property
     def tag_tools_enabled(self):
@@ -2089,6 +2115,75 @@ def handle_message(message, client, config):
     return jsonrpc_error(message_id, -32601, f'Method not found: {method}')
 
 
+def origin_allowed(origin, host, config):
+    """Check the Origin header (DNS-rebinding protection).
+
+    With NEXTCLOUD_MCP_ALLOWED_ORIGINS set, a present Origin must match one
+    of the configured origins exactly. Without it, a present Origin must be
+    the same origin as the request's Host header. Requests without an
+    Origin header (server-to-server MCP clients) are allowed.
+    """
+    if not origin:
+        return True
+    allowed = config.allowed_origins
+    if allowed:
+        normalized = origin.strip().rstrip('/').lower()
+        return any(normalized == item.lower() for item in allowed)
+    parsed = urllib.parse.urlsplit(origin)
+    return bool(parsed.netloc) and parsed.netloc.lower() == (host or '').lower()
+
+
+BASIC_CHALLENGE = {'WWW-Authenticate': 'Basic realm="nextcloud-mcp"'}
+
+
+def check_post(origin, host, length, authorization, config):
+    """Refuse a POST /mcp before its body is read, or return None.
+
+    Shared by the standard-library server and the OAuth (ASGI) server. The
+    result is (status, headers, payload); payload None means an empty body.
+    """
+    if not origin_allowed(origin, host, config):
+        return 403, {}, {'error': 'origin not allowed'}
+    if not authorization:
+        return 401, BASIC_CHALLENGE, None
+    if length <= 0:
+        return 400, {}, jsonrpc_error(None, -32700, 'empty body')
+    if length > config.max_body_bytes:
+        return 413, {}, jsonrpc_error(None, -32600, 'body too large')
+    return None
+
+
+def answer_post(raw, client, config, challenge=None):
+    """Answer the body of an accepted POST /mcp as (status, headers, payload).
+
+    initialize checks the credential against Nextcloud first, so a client
+    with a rejected credential gets HTTP 401 (and can start the auth flow)
+    instead of a session that fails on every tool call.
+    """
+    try:
+        message = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        return 400, {}, jsonrpc_error(None, -32700, 'parse error')
+    if isinstance(message, list):
+        return 400, {}, jsonrpc_error(None, -32600, 'batch is not supported')
+    if isinstance(message, dict) and message.get('method') == 'initialize':
+        try:
+            client.whoami()
+        except NextcloudError as error:
+            if error.status in (401, 403):
+                return 401, challenge or BASIC_CHALLENGE, None
+            log.warning('initialize: Nextcloud did not answer: %s', error)
+        except ToolError as error:
+            # Connection failures (from URLError) are not NextcloudError,
+            # so catch them here as well: otherwise every initialize call
+            # would kill the handler thread with an exception.
+            log.warning('initialize: Nextcloud did not answer: %s', error)
+    response = handle_message(message, client, config)
+    if response is None:
+        return 202, {}, None
+    return 200, {}, response
+
+
 def health_payload(config):
     return {'status': 'ok', 'server': SERVER_NAME, 'version': VERSION,
             'read_only': config.read_only, 'tag_tools': config.tag_tools_enabled}
@@ -2117,25 +2212,6 @@ class McpHandler(BaseHTTPRequestHandler):
     def _authorization(self):
         return self.headers.get('Authorization') or ''
 
-    def _origin_allowed(self):
-        """Check the Origin header (DNS-rebinding protection).
-
-        With NEXTCLOUD_MCP_ALLOWED_ORIGINS set, a present Origin must match one
-        of the configured origins exactly. Without it, a present Origin must be
-        the same origin as the request's Host header. Requests without an
-        Origin header (server-to-server MCP clients) are allowed.
-        """
-        origin = self.headers.get('Origin')
-        if not origin:
-            return True
-        allowed = self.server.config.allowed_origins
-        if allowed:
-            normalized = origin.strip().rstrip('/').lower()
-            return any(normalized == item.lower() for item in allowed)
-        parsed = urllib.parse.urlsplit(origin)
-        host = self.headers.get('Host') or ''
-        return bool(parsed.netloc) and parsed.netloc.lower() == host.lower()
-
     def do_GET(self):
         route = urllib.parse.urlparse(self.path).path
         if route == '/healthz':
@@ -2159,56 +2235,24 @@ class McpHandler(BaseHTTPRequestHandler):
         if urllib.parse.urlparse(self.path).path != '/mcp':
             self._send_json(404, {'error': 'not found'})
             return
-        if not self._origin_allowed():
-            self._send_json(403, {'error': 'origin not allowed'})
-            return
-        authorization = self._authorization()
-        if not authorization:
-            self.send_response(401)
-            self.send_header('WWW-Authenticate', 'Basic realm="nextcloud-mcp"')
-            self.send_header('Content-Length', '0')
-            self.end_headers()
-            return
         try:
             length = int(self.headers.get('Content-Length') or 0)
         except ValueError:
             length = 0
-        if length <= 0:
-            self._send_json(400, jsonrpc_error(None, -32700, 'empty body'))
+        refused = check_post(self.headers.get('Origin'), self.headers.get('Host'), length,
+                             self._authorization(), self.server.config)
+        if refused is None:
+            client = self.server.client_factory(self._authorization())
+            refused = answer_post(self.rfile.read(length), client, self.server.config)
+        status, headers, payload = refused
+        if payload is None:
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
             return
-        if length > self.server.config.max_body_bytes:
-            self._send_json(413, jsonrpc_error(None, -32600, 'body too large'))
-            return
-        try:
-            message = json.loads(self.rfile.read(length).decode('utf-8'))
-        except (ValueError, UnicodeDecodeError):
-            self._send_json(400, jsonrpc_error(None, -32700, 'parse error'))
-            return
-        if isinstance(message, list):
-            self._send_json(400, jsonrpc_error(None, -32600, 'batch is not supported'))
-            return
-        client = self.server.client_factory(authorization)
-        if isinstance(message, dict) and message.get('method') == 'initialize':
-            try:
-                client.whoami()
-            except NextcloudError as error:
-                if error.status in (401, 403):
-                    self.send_response(401)
-                    self.send_header('WWW-Authenticate', 'Basic realm="nextcloud-mcp"')
-                    self.send_header('Content-Length', '0')
-                    self.end_headers()
-                    return
-                log.warning('initialize: Nextcloud did not answer: %s', error)
-            except ToolError as error:
-                # Connection failures (from URLError) are not NextcloudError,
-                # so catch them here as well: otherwise every initialize call
-                # would kill the handler thread with an exception.
-                log.warning('initialize: Nextcloud did not answer: %s', error)
-        response = handle_message(message, client, self.server.config)
-        if response is None:
-            self._send_empty(202)
-            return
-        self._send_json(200, response)
+        self._send_json(status, payload)
 
 
 class McpServer(ThreadingHTTPServer):
@@ -2247,6 +2291,12 @@ def main():
         log.info('music tag tools are disabled '
                  '(set NEXTCLOUD_MCP_TAG_API_URL and NEXTCLOUD_MCP_TAG_API_TOKEN to enable them)')
     cleanup_tmp(config.tmp)
+    if config.auth != 'basic':
+        # OAuth needs the optional dependencies (pip install fastmcp uvicorn);
+        # Basic-only deployments keep running on the standard library.
+        import nextcloud_mcp_oauth
+        nextcloud_mcp_oauth.serve(config, sys.modules[__name__])
+        return
     server = build_server((config.bind, config.port), config)
     log.info('listening on %s:%s (Nextcloud %s, read_only=%s, music_root=%s, tag_tools=%s)',
              config.bind, config.port, config.base_url, config.read_only,

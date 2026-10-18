@@ -5,6 +5,9 @@ A small [MCP](https://modelcontextprotocol.io/) server that lets AI agents
 pack or unpack archives and manage CalDAV calendar events — **as the
 connecting user**. It implements the Streamable HTTP transport (`POST /mcp`)
 with the Python standard library only: no dependencies, no database, no state.
+Optionally, MCP clients can log in with OAuth 2.1 through Nextcloud's
+built-in OAuth2 app instead of carrying an app password (see
+[OAuth](#oauth)).
 
 ## What it does
 
@@ -23,11 +26,12 @@ with the Python standard library only: no dependencies, no database, no state.
 
 ## Design
 
-- **Pass-through authentication.** The `Authorization` header of the MCP
-  request is forwarded to Nextcloud unchanged (Basic with a user/app password
-  today, a Bearer token with the same header later). Every operation is
-  executed by Nextcloud as that user, so ACLs, shares, quotas, versions and the
-  trash keep applying. The server never stores, caches or logs credentials.
+- **The caller's own credential.** With Basic, the `Authorization` header of
+  the MCP request is forwarded to Nextcloud unchanged and nothing is stored.
+  With OAuth, each request carries the caller's own Nextcloud OAuth2 token.
+  Either way every operation is executed by Nextcloud as that user, so ACLs,
+  shares, quotas, versions and the trash keep applying. Credentials are never
+  logged.
 - **No sessions.** Each JSON-RPC message is answered by a single JSON response;
   `initialize`, `ping`, `tools/list` and `tools/call` are implemented.
   `initialize` verifies the credentials against Nextcloud (`whoami`) and
@@ -130,9 +134,16 @@ stable; they are not changed between minor versions.
 | `NEXTCLOUD_MCP_MAX_ZIP_BYTES` | `4294967296` | Maximum total size packed into a zip (4 GiB). |
 | `NEXTCLOUD_MCP_TIMEOUT` | `120` | Nextcloud/tag API HTTP timeout in seconds. |
 | `NEXTCLOUD_MCP_ARCHIVE_TIMEOUT` | `1800` | Timeout in seconds for archive downloads/uploads. |
+| `NEXTCLOUD_MCP_AUTH` | `basic` | `basic`, `oauth` or `both` (see [OAuth](#oauth)). |
+| `NEXTCLOUD_MCP_PUBLIC_URL` | *(empty)* | OAuth: public HTTPS URL of this server, without `/mcp`. |
+| `NEXTCLOUD_MCP_NEXTCLOUD_PUBLIC_URL` | `NEXTCLOUD_MCP_BASE_URL` | OAuth: Nextcloud URL as seen by browsers. |
+| `NEXTCLOUD_MCP_OAUTH_CLIENT_ID` | *(empty)* | OAuth: client identifier of the Nextcloud OAuth2 client. |
+| `NEXTCLOUD_MCP_OAUTH_CLIENT_SECRET` | *(empty)* | OAuth: client secret of the Nextcloud OAuth2 client. |
+| `NEXTCLOUD_MCP_OAUTH_REDIRECT_URIS` | *(empty)* | OAuth: allowed MCP client redirect URIs, comma-separated, wildcards allowed. Empty accepts registered URIs (loopback ports may vary). |
+| `NEXTCLOUD_MCP_STATE_DIR` | `/var/lib/nextcloud-mcp` | OAuth: client registrations and encrypted Nextcloud tokens. Must persist. |
 
 `GET /healthz` returns
-`{"status":"ok","server":"nextcloud","version":"1.1.0","read_only":false,"tag_tools":false}`.
+`{"status":"ok","server":"nextcloud","version":"1.2.0","read_only":false,"tag_tools":false}`.
 
 ## Running with Docker
 
@@ -187,6 +198,62 @@ curl -s http://127.0.0.1:5811/healthz
 revoked in *Settings → Security* without touching the account, and it survives
 2FA. `<base64(user:app-password)>` below is the standard Basic credential:
 `printf '%s' 'alice:app-password' | base64`.
+
+## OAuth
+
+MCP clients such as opencode and Claude Code can log in with the OAuth 2.1
+flow of the MCP specification, so no app password has to be pasted into the
+client configuration. Nothing beyond Nextcloud itself is needed: the server
+uses Nextcloud's built-in OAuth2 app.
+
+How it works: Nextcloud's OAuth2 app has no discovery, PKCE or dynamic client
+registration, which MCP clients require. This server fills that gap with
+[FastMCP](https://gofastmcp.com/)'s OAuth proxy: it publishes
+`/.well-known/oauth-protected-resource` and
+`/.well-known/oauth-authorization-server`, answers `401` with
+`WWW-Authenticate: Bearer resource_metadata=...`, registers MCP clients,
+checks PKCE, shows a consent page and then sends the user to Nextcloud's own
+login and authorization page. The Nextcloud token it receives is stored
+encrypted in `NEXTCLOUD_MCP_STATE_DIR`; the MCP client gets a separate token
+issued by this server. Each request then reaches Nextcloud with the caller's
+own Nextcloud token, so the caller's ACLs apply exactly as with Basic.
+
+1. In Nextcloud, add an OAuth2 client (*Administration settings → Security →
+   OAuth 2.0 clients*, or
+   `occ oauth2:add-client nextcloud-mcp https://nextcloud-mcp.example.net/auth/callback`)
+   with the redirect URI `<NEXTCLOUD_MCP_PUBLIC_URL>/auth/callback`.
+2. Set `NEXTCLOUD_MCP_AUTH=oauth` (or `both` to keep Basic clients working),
+   `NEXTCLOUD_MCP_PUBLIC_URL`, `NEXTCLOUD_MCP_OAUTH_CLIENT_ID` and
+   `NEXTCLOUD_MCP_OAUTH_CLIENT_SECRET`. Set
+   `NEXTCLOUD_MCP_NEXTCLOUD_PUBLIC_URL` when `NEXTCLOUD_MCP_BASE_URL` is an
+   address the users' browsers cannot open.
+3. Install the optional packages (`pip install -r requirements-oauth.txt`; the
+   Docker image already has them) and keep `NEXTCLOUD_MCP_STATE_DIR` on
+   persistent storage.
+4. Serve it over HTTPS (see [TLS termination](#tls-termination)) and remove the
+   `Authorization` header from the client configuration.
+
+opencode:
+
+```json
+{
+  "mcp": {
+    "nextcloud": {
+      "type": "remote",
+      "url": "https://nextcloud-mcp.example.net/mcp",
+      "oauth": {}
+    }
+  }
+}
+```
+
+Then run `opencode mcp auth nextcloud`. Claude Code: `claude mcp add
+--transport http nextcloud https://nextcloud-mcp.example.net/mcp` and log in
+with `/mcp`.
+
+Nextcloud OAuth2 access tokens expire after one hour; the server refreshes
+them with the refresh token. Revoking the client in Nextcloud
+(*Personal settings → Security*) ends the session.
 
 ## Connecting an MCP client
 
@@ -294,18 +361,29 @@ an `Origin` header; the reverse proxy must forward the header.
   with no rollback: if an upload fails halfway, the already-extracted files
   stay in the target folder. Check the `files`/`bytes` result and clean up the
   target before retrying.
+- **OAuth.** Run it over HTTPS only (the consent cookies and tokens depend on
+  it). Anyone can register an MCP client, but a token is only issued after the
+  user approves the consent page and logs in to Nextcloud. Narrow the accepted
+  redirect URIs with `NEXTCLOUD_MCP_OAUTH_REDIRECT_URIS` when you know your
+  clients. `NEXTCLOUD_MCP_STATE_DIR` holds encrypted Nextcloud tokens: keep it
+  private (mode 0700) and back it up only if you want sessions to survive a
+  rebuild. The encryption key is derived from the OAuth client secret, so
+  changing the secret logs everyone out.
 - **Rate and body limits** (`NEXTCLOUD_MCP_MAX_BODY_BYTES`, per-tool byte
   limits) protect the service from oversized payloads and zip bombs.
 
 ## Development
 
-The implementation and the tests use the standard library only (Python 3.10 or
-newer; `ast` verifies the imports, CI runs 3.10–3.13). `ruff` (E, F, W, I) is
-used for lint and is not a runtime dependency.
+`nextcloud_mcp.py` and its tests use the standard library only (Python 3.10
+or newer; `ast` verifies the imports, CI runs 3.10–3.13). The OAuth front end
+(`nextcloud_mcp_oauth.py`) needs `requirements-oauth.txt`; its tests
+(`tests/test_oauth.py`) are skipped when those packages are missing. `ruff`
+(E, F, W, I) is used for lint and is not a runtime dependency.
 
 ```bash
+pip install -r requirements-oauth.txt   # optional, for the OAuth tests
 python3 -m unittest discover -s tests -v
-python3 -m py_compile nextcloud_mcp.py
+python3 -m py_compile nextcloud_mcp.py nextcloud_mcp_oauth.py
 ruff check .
 docker build -t nextcloud-mcp:dev .
 ```
@@ -319,11 +397,10 @@ validation, and real HTTP round trips against fake Nextcloud/tag API servers.
 - **Calendar updates and deletions** (`nextcloud_update_event` /
   `nextcloud_delete_event`) and free/busy-aware suggestions.
 - **stdio / `uvx` transport** for local, single-user agents (no reverse proxy).
-- **OAuth** so MCP clients can obtain per-user tokens instead of forwarding
-  Basic credentials, and a per-user tag API ACL.
+- A per-user tag API ACL.
 
 Calendar write support is create-only in 1.1; the other items are out of scope
-for 1.x. HTTP + Basic/app password is the supported transport today.
+for 1.x.
 
 ## 日本語の概要
 
@@ -367,6 +444,18 @@ Nextcloud MCPサーバーは、AIエージェント（opencode等）にNextcloud
 
 1.1.0ではカレンダー3ツールを追加しました。カレンダー書き込みは追加のみで、
 更新・削除は今後の対応です。
+
+1.2.0ではOAuthに対応しました。`NEXTCLOUD_MCP_AUTH=oauth`（Basicも受けるなら
+`both`）にすると、MCPクライアントはMCP仕様のOAuth 2.1でログインでき、
+アプリパスワードをクライアントの設定に書かずに済みます。Nextcloud以外に
+必要なものはなく、Nextcloud標準のOAuth2アプリを使います（管理設定→
+セキュリティ→OAuth 2.0クライアントに `<NEXTCLOUD_MCP_PUBLIC_URL>/auth/callback`
+を登録し、表示されたIDと秘密値を設定）。標準のOAuth2アプリに無い
+認可サーバ情報・PKCE・クライアント登録はFastMCPのOAuthプロキシが受け持ち、
+各リクエストは呼び出し元自身のNextcloudトークンで届くため、ACLはBasicと
+同じく呼び出し元に従います。OAuthを使うときだけ `requirements-oauth.txt`
+が必要です（Dockerイメージには同梱）。既定は従来どおり `basic` で、
+標準ライブラリだけで動きます。
 
 想定配備はDocker（`compose.yaml`、ホストの `127.0.0.1:5811` のみ公開）か
 systemdユニットで、どちらも前段にHTTPSリバースプロキシを置く前提です。

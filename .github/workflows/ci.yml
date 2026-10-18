@@ -21,12 +21,12 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install lint
-        run: pip install ruff
+      - name: Install lint and the optional OAuth packages
+        run: pip install ruff -r requirements-oauth.txt
       - name: Lint
         run: ruff check .
       - name: Syntax check
-        run: python3 -m py_compile nextcloud_mcp.py
+        run: python3 -m py_compile nextcloud_mcp.py nextcloud_mcp_oauth.py
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
 

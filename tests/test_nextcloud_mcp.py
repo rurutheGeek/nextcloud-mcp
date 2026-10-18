@@ -1878,14 +1878,16 @@ class StandardLibraryOnlyTests(unittest.TestCase):
                 roots.update(alias.name.split('.')[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
                 roots.add(node.module.split('.')[0])
-        third_party = sorted(roots - set(sys.stdlib_module_names))
+        # nextcloud_mcp_oauth is imported only when NEXTCLOUD_MCP_AUTH is not
+        # basic, so a Basic-only deployment still runs on the standard library.
+        third_party = sorted(roots - set(sys.stdlib_module_names) - {'nextcloud_mcp_oauth'})
         self.assertEqual(third_party, [], f'third-party imports: {third_party}')
 
 
 class DocumentationTests(unittest.TestCase):
     def test_every_environment_variable_is_documented(self):
         variables = set(re.findall(r'NEXTCLOUD_MCP_[A-Z_]+',
-                                   SOURCE.read_text(encoding='utf-8')))
+                                   SOURCE.read_text(encoding='utf-8') + read('nextcloud_mcp_oauth.py')))
         env_example = read('.env.example')
         readme = read('README.md')
         self.assertTrue(variables)

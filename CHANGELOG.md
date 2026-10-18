@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-18
+
+### Added
+
+- OAuth 2.1 login for MCP clients (`NEXTCLOUD_MCP_AUTH=oauth`, or `both` to
+  keep accepting Basic). Uses Nextcloud's built-in OAuth2 app as the upstream
+  identity provider; FastMCP's OAuth proxy supplies the protected resource
+  and authorization server metadata, dynamic client registration, PKCE and a
+  consent page. Each request reaches Nextcloud with the caller's own
+  Nextcloud token, so the caller's ACLs keep applying.
+- `NEXTCLOUD_MCP_PUBLIC_URL`, `NEXTCLOUD_MCP_NEXTCLOUD_PUBLIC_URL`,
+  `NEXTCLOUD_MCP_OAUTH_CLIENT_ID`, `NEXTCLOUD_MCP_OAUTH_CLIENT_SECRET`,
+  `NEXTCLOUD_MCP_OAUTH_REDIRECT_URIS` and `NEXTCLOUD_MCP_STATE_DIR`.
+- `requirements-oauth.txt` (pinned `fastmcp` and `uvicorn`), installed in the
+  Docker image.
+
+### Changed
+
+- `basic` stays the default and keeps running on the standard library only;
+  the OAuth packages are imported only when OAuth is enabled.
+- The POST `/mcp` handling is shared by the standard-library server and the
+  OAuth server (`check_post`, `answer_post`).
+
 ## [1.1.0] - 2026-09-28
 
 ### Added
