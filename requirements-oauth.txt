@@ -1,4 +1,4 @@
 # Optional: needed only for NEXTCLOUD_MCP_AUTH=oauth or both.
 # Basic-only deployments run on the Python standard library.
-fastmcp==4.1.1
+fastmcp==4.1.3
 uvicorn==0.54.0
