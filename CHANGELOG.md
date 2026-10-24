@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-24
+
+### Added
+
+- Deck tools: `nextcloud_deck_boards`, `nextcloud_deck_cards`,
+  `nextcloud_deck_create_card`, `nextcloud_deck_update_card`,
+  `nextcloud_deck_move_card`, `nextcloud_deck_comments` and
+  `nextcloud_deck_add_comment`. They speak Deck's JSON API with the caller's
+  own credential, so board shares and edit permissions keep applying. Board
+  and stack arguments accept an id or a title; cards keep their description
+  (truncated at 16 KiB) so an agent can turn what a person wrote into an issue.
+- A clear error when the Nextcloud Deck app is missing: the Deck tools check
+  the `deck` capability on `/ocs/v2.php/cloud/capabilities`.
+
+### Changed
+
+- The capability response is fetched once per client and shared by the
+  calendar and Deck checks.
+
 ## [1.2.0] - 2026-10-18
 
 ### Added

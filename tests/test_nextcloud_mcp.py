@@ -1076,6 +1076,217 @@ class FakeNextcloudClient:
         return {'etag': 'created-etag'}
 
 
+DECK_TEST_BOARD = {
+    'id': 2, 'title': 'ホームラボ', 'color': '0082c9', 'archived': False,
+    'owner': {'uid': 'admin', 'displayname': 'admin'},
+    'permissions': {'PERMISSION_EDIT': True},
+    'labels': [{'id': 11, 'title': 'bot'}, {'id': 12, 'title': 'ネットワーク'}],
+    'acl': [{'participant': {'displayname': 'homelab'}}],
+}
+
+
+def deck_test_stacks():
+    return [
+        {'id': 5, 'title': '依頼', 'order': 0, 'cards': [
+            {'id': 11, 'title': 'カードA', 'description': '説明A', 'stackId': 5, 'order': 0,
+             'labels': [11], 'owner': {'uid': 'alice', 'displayname': 'Alice'},
+             'commentsCount': 1, 'assignedUsers': [], 'archived': False, 'done': None,
+             'lastModified': 1, 'type': 'plain', 'duedate': None},
+        ]},
+        {'id': 6, 'title': '着手中', 'order': 1, 'cards': []},
+    ]
+
+
+class FakeDeckClient:
+    """In-memory stand-in for the Deck part of NextcloudClient."""
+
+    def __init__(self, boards=None, stacks=None, comments=None, deck_app=True):
+        self.deck_app = deck_app
+        self.boards = boards if boards is not None else [dict(DECK_TEST_BOARD)]
+        self.stacks = stacks if stacks is not None else deck_test_stacks()
+        self.comments = comments if comments is not None else {}
+        self.create_calls = []
+        self.update_calls = []
+        self.move_calls = []
+        self.comment_calls = []
+
+    def whoami(self):
+        return {'id': 'alice', 'displayname': 'Alice'}
+
+    @property
+    def user_id(self):
+        return 'alice'
+
+    def deck_app_available(self):
+        return self.deck_app
+
+    def deck_boards(self):
+        if not self.deck_app:
+            raise mcp.ToolError(mcp.DECK_APP_MISSING)
+        return [dict(board) for board in self.boards]
+
+    def deck_stacks(self, board_id):
+        return self.stacks
+
+    def _find(self, stack_id, card_id):
+        for stack in self.stacks:
+            if int(stack['id']) == int(stack_id):
+                for card in stack['cards']:
+                    if int(card['id']) == int(card_id):
+                        return stack, card
+        raise mcp.ToolError(f'Deck card not found: {card_id}')
+
+    def deck_card(self, board_id, stack_id, card_id):
+        return dict(self._find(stack_id, card_id)[1])
+
+    def deck_create_card(self, board_id, stack_id, payload):
+        self.create_calls.append((board_id, stack_id, dict(payload)))
+        card = {'id': 99, 'title': payload['title'],
+                'description': payload.get('description', ''),
+                'stackId': int(stack_id), 'order': payload.get('order', 999),
+                'type': 'plain', 'labels': list(payload.get('labels') or []),
+                'owner': {'uid': 'alice', 'displayname': 'Alice'}, 'commentsCount': 0,
+                'assignedUsers': [], 'archived': False, 'done': None,
+                'lastModified': 1, 'duedate': None}
+        for stack in self.stacks:
+            if int(stack['id']) == int(stack_id):
+                stack['cards'].append(card)
+                break
+        return card
+
+    def deck_update_card(self, board_id, stack_id, card_id, payload):
+        self.update_calls.append((board_id, stack_id, card_id, dict(payload)))
+        _stack, card = self._find(stack_id, card_id)
+        card.update({'title': payload['title'], 'description': payload['description']})
+        return dict(card)
+
+    def deck_move_card(self, board_id, card_id, stack_id, order):
+        self.move_calls.append((board_id, card_id, stack_id, order))
+        source = target = card = None
+        for stack in self.stacks:
+            for item in list(stack['cards']):
+                if int(item['id']) == int(card_id):
+                    source, card = stack, item
+            if int(stack['id']) == int(stack_id):
+                target = stack
+        if card is None or target is None:
+            raise mcp.ToolError(f'Deck card not found: {card_id}')
+        source['cards'].remove(card)
+        card['stackId'] = int(stack_id)
+        card['order'] = order
+        target['cards'].append(card)
+        return target['cards']
+
+    def deck_comments(self, card_id, limit=20, offset=0):
+        return list(self.comments.get(int(card_id), []))[offset:offset + limit]
+
+    def deck_add_comment(self, card_id, message):
+        comment = {'id': len(self.comments.get(int(card_id), [])) + 1,
+                   'message': message, 'actorDisplayName': 'Alice',
+                   'creationDateTime': '2026-10-24T00:00:00+00:00'}
+        self.comments.setdefault(int(card_id), []).append(comment)
+        self.comment_calls.append((card_id, message))
+        return comment
+
+
+class DeckToolTests(unittest.TestCase):
+    def setUp(self):
+        self.client = FakeDeckClient()
+        self.config = make_config()
+
+    def test_boards_include_labels_and_shared_with(self):
+        result = mcp.tool_deck_boards(self.client, self.config, {})
+        self.assertEqual(result['count'], 1)
+        self.assertEqual(result['boards'][0]['labels'][0]['title'], 'bot')
+        self.assertEqual(result['boards'][0]['shared_with'], ['homelab'])
+
+    def test_boards_report_a_missing_deck_app(self):
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_deck_boards(FakeDeckClient(deck_app=False), self.config, {})
+        self.assertIn('Deck app', str(caught.exception))
+
+    def test_cards_resolve_a_board_title_and_keep_descriptions(self):
+        result = mcp.tool_deck_cards(self.client, self.config, {'board': 'ホームラボ'})
+        self.assertEqual(result['count'], 1)
+        self.assertEqual(result['cards'][0]['title'], 'カードA')
+        self.assertEqual(result['cards'][0]['description'], '説明A')
+        self.assertEqual(result['cards'][0]['labels'][0]['title'], 'bot')
+        self.assertEqual(result['cards'][0]['stack'], '依頼')
+
+    def test_cards_can_filter_one_stack(self):
+        result = mcp.tool_deck_cards(self.client, self.config,
+                                     {'board': '2', 'stack': '着手中'})
+        self.assertEqual(result['count'], 0)
+
+    def test_cards_truncate_a_long_description(self):
+        self.client.stacks[0]['cards'][0]['description'] = 'x' * (mcp.DECK_MAX_DESCRIPTION + 10)
+        result = mcp.tool_deck_cards(self.client, self.config, {'board': '2'})
+        self.assertTrue(result['cards'][0]['description_truncated'])
+        self.assertEqual(len(result['cards'][0]['description']), mcp.DECK_MAX_DESCRIPTION)
+
+    def test_an_unknown_board_is_reported_with_the_visible_ones(self):
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_deck_cards(self.client, self.config, {'board': 'nope'})
+        self.assertIn('Visible boards', str(caught.exception))
+
+    def test_create_card_passes_labels_and_re_reads_the_card(self):
+        result = mcp.tool_deck_create_card(self.client, self.config, {
+            'board': 'ホームラボ', 'stack': '依頼', 'title': '新しい依頼',
+            'description': '本文', 'labels': [11]})
+        self.assertTrue(result['created'])
+        self.assertEqual(self.client.create_calls[0][2]['labels'], [11])
+        self.assertEqual(result['card']['labels'], [{'id': 11, 'title': 'bot'}])
+        self.assertEqual(result['card']['title'], '新しい依頼')
+
+    def test_create_card_refuses_an_unknown_label(self):
+        with self.assertRaises(mcp.ToolError) as caught:
+            mcp.tool_deck_create_card(self.client, self.config, {
+                'board': '2', 'stack': '依頼', 'title': 'x', 'labels': [99]})
+        self.assertIn('Unknown Deck labels', str(caught.exception))
+
+    def test_update_keeps_fields_that_were_not_passed(self):
+        result = mcp.tool_deck_update_card(self.client, self.config, {
+            'board': '2', 'card_id': 11, 'description': '新しい説明'})
+        self.assertEqual(result['card']['title'], 'カードA')
+        self.assertEqual(result['card']['description'], '新しい説明')
+        _board, stack_id, _card_id, payload = self.client.update_calls[0]
+        self.assertEqual(stack_id, 5)
+        self.assertEqual(payload['stackId'], 5)
+
+    def test_update_can_move_to_another_stack(self):
+        result = mcp.tool_deck_update_card(self.client, self.config, {
+            'board': '2', 'card_id': 11, 'stack': '着手中', 'order': 0})
+        self.assertEqual(result['card']['stack'], '着手中')
+        self.assertEqual(self.client.move_calls, [(2, 11, 6, 0)])
+
+    def test_move_reports_the_source_and_target(self):
+        result = mcp.tool_deck_move_card(self.client, self.config, {
+            'board': '2', 'card_id': 11, 'stack': '着手中'})
+        self.assertEqual(result['from'], '依頼')
+        self.assertEqual(result['to'], '着手中')
+        self.assertEqual(result['card']['stack'], '着手中')
+
+    def test_comments_are_listed_and_added(self):
+        self.client.comments[11] = [{'id': 1, 'message': '既存', 'actorDisplayName': 'Alice',
+                                     'creationDateTime': '2026-10-24T00:00:00+00:00'}]
+        listed = mcp.tool_deck_comments(self.client, self.config, {'card_id': 11})
+        self.assertEqual(listed['count'], 1)
+        self.assertEqual(listed['comments'][0]['message'], '既存')
+        added = mcp.tool_deck_add_comment(self.client, self.config,
+                                          {'card_id': 11, 'message': 'issue #1'})
+        self.assertTrue(added['added'])
+        self.assertEqual(self.client.comment_calls, [(11, 'issue #1')])
+
+    def test_deck_write_tools_are_hidden_in_read_only_mode(self):
+        names = {tool['name'] for tool in
+                 mcp.available_tools(make_config(NEXTCLOUD_MCP_READ_ONLY='1'))}
+        self.assertIn('nextcloud_deck_boards', names)
+        self.assertIn('nextcloud_deck_cards', names)
+        self.assertIn('nextcloud_deck_comments', names)
+        self.assertNotIn('nextcloud_deck_create_card', names)
+        self.assertNotIn('nextcloud_deck_add_comment', names)
+
+
 def music_client(root='/music'):
     return FakeNextcloudClient(files={
         '/': {'is_dir': True, 'writable': True, 'etag': 'root'},

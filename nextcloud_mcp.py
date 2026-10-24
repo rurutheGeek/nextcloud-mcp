@@ -2,10 +2,10 @@
 """Nextcloud MCP server for AI agents.
 
 Gives AI agents (opencode, Claude, ...) MCP tools to read and write Nextcloud
-files, edit MP3 tags, pack/unpack archives and list/create CalDAV calendar
-events. Every request reaches Nextcloud with the caller's own credential, so
-permissions, shares, quotas and the trash follow the caller's own Nextcloud
-ACLs.
+files, edit MP3 tags, pack/unpack archives, list/create CalDAV calendar
+events, and read/write Deck boards, stacks, cards and comments. Every request
+reaches Nextcloud with the caller's own credential, so permissions, shares,
+quotas and the trash follow the caller's own Nextcloud ACLs.
 
 NEXTCLOUD_MCP_AUTH=basic (default) forwards the caller's Basic Authorization
 header as-is, stores nothing and needs only the standard library. oauth and
@@ -68,7 +68,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 SERVER_NAME = 'nextcloud'
 USER_AGENT = ('nextcloud-mcp/' + VERSION +
               ' (+https://github.com/rurutheGeek/nextcloud-mcp)')
@@ -85,6 +85,18 @@ CALENDAR_APP_MISSING = (
     'The Nextcloud Calendar app is not available on this server: the "calendar" '
     'capability is missing from /ocs/v2.php/cloud/capabilities. Ask an '
     'administrator to install and enable the Calendar extension, then retry.')
+
+DECK_APP_MISSING = (
+    'The Nextcloud Deck app is not available on this server: the "deck" '
+    'capability is missing from /ocs/v2.php/cloud/capabilities. Ask an '
+    'administrator to install and enable the Deck extension, then retry.')
+
+# Deck's JSON API lives below index.php for boards, stacks and cards. Comments
+# are only exposed by the OCS variant (v1.0+).
+DECK_API = '/index.php/apps/deck/api/v1.0'
+DECK_OCS_API = '/ocs/v2.php/apps/deck/api/v1.0'
+DECK_MAX_DESCRIPTION = 16 * 1024
+DECK_MAX_COMMENT = 16 * 1024
 
 CALENDAR_PROPFIND_BODY = (
     '<?xml version="1.0" encoding="utf-8"?>'
@@ -324,7 +336,9 @@ class NextcloudClient:
         self.authorization = authorization
         self.config = config
         self._user = None
+        self._capabilities = None
         self._calendar_capability = None
+        self._deck_capability = None
 
     def request(self, method, path, body=None, headers=None, timeout=None):
         request = urllib.request.Request(self.config.base_url + path, data=body, method=method)
@@ -492,13 +506,26 @@ class NextcloudClient:
             })
         return results
 
+    def capabilities(self):
+        """Return the OCS capability map, fetched once per client."""
+        if self._capabilities is None:
+            data = self.ocs_json('/ocs/v2.php/cloud/capabilities')
+            self._capabilities = data.get('capabilities') if isinstance(data, dict) else {}
+        return self._capabilities
+
     def calendar_app_available(self):
         """Check the OCS capability so a disabled Calendar app is reported clearly."""
         if self._calendar_capability is None:
-            data = self.ocs_json('/ocs/v2.php/cloud/capabilities')
-            capabilities = data.get('capabilities') if isinstance(data, dict) else {}
+            capabilities = self.capabilities()
             self._calendar_capability = bool(capabilities and 'calendar' in capabilities)
         return self._calendar_capability
+
+    def deck_app_available(self):
+        """Check the OCS capability so a disabled Deck app is reported clearly."""
+        if self._deck_capability is None:
+            capabilities = self.capabilities()
+            self._deck_capability = bool(capabilities and 'deck' in capabilities)
+        return self._deck_capability
 
     def calendar_home_path(self):
         return f'/remote.php/dav/calendars/{urllib.parse.quote(self.user_id, safe="")}'
@@ -568,6 +595,85 @@ class NextcloudClient:
                 raise ToolError(f'An event with this uid already exists in the calendar '
                                 f'({resource_name}); pass another uid') from error
             raise
+
+    # -- Deck ---------------------------------------------------------------
+
+    def deck_request(self, method, path, body=None, query=None):
+        """Call Deck's JSON API (boards, stacks, cards) and decode the response."""
+        if not self.deck_app_available():
+            raise ToolError(DECK_APP_MISSING)
+        if query:
+            path = path + '?' + urllib.parse.urlencode(query)
+        headers = {'OCS-APIRequest': 'true', 'Accept': 'application/json'}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode('utf-8')
+            headers['Content-Type'] = 'application/json'
+        with self.request(method, DECK_API + path, body=data, headers=headers) as response:
+            raw = response.read()
+        return json.loads(raw.decode('utf-8')) if raw.strip() else None
+
+    def deck_ocs_request(self, method, path, body=None, query=None):
+        """Call the Deck OCS API (comments) and unwrap the ocs envelope."""
+        if not self.deck_app_available():
+            raise ToolError(DECK_APP_MISSING)
+        if query:
+            path = path + '?' + urllib.parse.urlencode(query)
+        headers = {'OCS-APIRequest': 'true', 'Accept': 'application/json'}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode('utf-8')
+            headers['Content-Type'] = 'application/json'
+        with self.request(method, DECK_OCS_API + path, body=data, headers=headers) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+        meta = payload.get('ocs', {}).get('meta', {})
+        status = int(meta.get('statuscode') or 0)
+        if status >= 400:
+            raise ToolError(f"Deck API error ({status}): {meta.get('message') or 'unknown'}")
+        return payload.get('ocs', {}).get('data')
+
+    def deck_boards(self):
+        """Boards the caller can see, with labels (the list endpoint omits them)."""
+        boards = self.deck_request('GET', '/boards') or []
+        detailed = []
+        for board in boards[:50]:
+            if board.get('deletedAt'):
+                continue
+            try:
+                detailed.append(self.deck_request('GET', f'/boards/{int(board["id"])}'))
+            except NextcloudError:
+                detailed.append(board)
+        return detailed
+
+    def deck_stacks(self, board_id):
+        return self.deck_request('GET', f'/boards/{int(board_id)}/stacks') or []
+
+    def deck_card(self, board_id, stack_id, card_id):
+        return self.deck_request(
+            'GET', f'/boards/{int(board_id)}/stacks/{int(stack_id)}/cards/{int(card_id)}')
+
+    def deck_create_card(self, board_id, stack_id, payload):
+        return self.deck_request(
+            'POST', f'/boards/{int(board_id)}/stacks/{int(stack_id)}/cards', payload)
+
+    def deck_update_card(self, board_id, stack_id, card_id, payload):
+        return self.deck_request(
+            'PUT', f'/boards/{int(board_id)}/stacks/{int(stack_id)}/cards/{int(card_id)}',
+            payload)
+
+    def deck_move_card(self, board_id, card_id, stack_id, order):
+        return self.deck_request(
+            'PUT', f'/boards/{int(board_id)}/stacks/{int(stack_id)}/cards/{int(card_id)}/reorder',
+            {'order': int(order)})
+
+    def deck_comments(self, card_id, limit=20, offset=0):
+        return self.deck_ocs_request(
+            'GET', f'/cards/{int(card_id)}/comments',
+            query={'limit': int(limit), 'offset': int(offset)}) or []
+
+    def deck_add_comment(self, card_id, message):
+        return self.deck_ocs_request(
+            'POST', f'/cards/{int(card_id)}/comments', {'message': message})
 
 
 def parse_dav_response(node, prefix):
@@ -1863,6 +1969,283 @@ def tool_create_event(client, config, args):
             'etag': result['etag'], 'overlaps': conflicts, 'warnings': warnings[:10]}
 
 
+def deck_int(raw, label):
+    """Accept an integer or a decimal string and return an int."""
+    if isinstance(raw, bool):
+        raise ToolError(f'{label} must be an integer')
+    if isinstance(raw, int):
+        return raw
+    text = str(raw if raw is not None else '').strip()
+    if not text.isdigit():
+        raise ToolError(f'{label} must be an integer')
+    return int(text)
+
+
+def resolve_deck_board(client, raw):
+    """Resolve a board by numeric id or exact title (case-insensitive)."""
+    wanted = str(raw if raw is not None else '').strip()
+    if not wanted:
+        raise ToolError('board is required (board id or title)')
+    boards = client.deck_boards()
+    if not boards:
+        raise ToolError('No Deck boards are visible to this user')
+    visible = ', '.join(f'{board["id"]}: {board.get("title")}' for board in boards)
+    if wanted.isdigit():
+        for board in boards:
+            if int(board['id']) == int(wanted):
+                return board
+        raise ToolError(f'Deck board not found: {wanted}. Visible boards: {visible}')
+    folded = wanted.casefold()
+    matches = [board for board in boards
+               if str(board.get('title') or '').casefold() == folded]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ToolError(f'Deck board not found: {wanted}. Visible boards: {visible}')
+    raise ToolError(f'Deck board title is ambiguous: {wanted}. Use an id: {visible}')
+
+
+def resolve_deck_stack(stacks, raw):
+    """Resolve a stack (list/column) by numeric id or exact title."""
+    wanted = str(raw if raw is not None else '').strip()
+    if not wanted:
+        raise ToolError('stack is required (stack id or title)')
+    visible = ', '.join(f'{stack["id"]}: {stack.get("title")}' for stack in stacks)
+    if wanted.isdigit():
+        for stack in stacks:
+            if int(stack['id']) == int(wanted):
+                return stack
+        raise ToolError(f'Deck stack not found: {wanted}. Stacks: {visible}')
+    folded = wanted.casefold()
+    matches = [stack for stack in stacks
+               if str(stack.get('title') or '').casefold() == folded]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ToolError(f'Deck stack not found: {wanted}. Stacks: {visible}')
+    raise ToolError(f'Deck stack title is ambiguous: {wanted}. Use an id: {visible}')
+
+
+def find_deck_card(stacks, card_id):
+    """Return (stack, card) for a card id, searching every stack."""
+    for stack in stacks:
+        for card in stack.get('cards') or []:
+            if int(card.get('id') or 0) == int(card_id):
+                return stack, card
+    raise ToolError(f'Deck card not found: {card_id}')
+
+
+def deck_labels(labels, labels_by_id=None):
+    """Return labels as {'id', 'title'} regardless of the API shape."""
+    result = []
+    for value in labels or []:
+        if isinstance(value, dict):
+            result.append({'id': value.get('id'), 'title': value.get('title') or ''})
+        else:
+            result.append({'id': value, 'title': (labels_by_id or {}).get(value, '')})
+    return result
+
+
+def deck_card_summary(card, stack=None, labels_by_id=None):
+    """Trim a Deck card to the fields an agent needs."""
+    description = str(card.get('description') or '')
+    owner = card.get('owner') or {}
+    return {
+        'id': card.get('id'),
+        'title': card.get('title') or '',
+        'description': description[:DECK_MAX_DESCRIPTION],
+        'description_truncated': len(description) > DECK_MAX_DESCRIPTION,
+        'stack': stack.get('title') if stack else None,
+        'stack_id': stack.get('id') if stack else card.get('stackId'),
+        'order': card.get('order'),
+        'labels': deck_labels(card.get('labels'), labels_by_id),
+        'assigned_users': [user.get('displayname') or user.get('uid')
+                           for user in card.get('assignedUsers') or []
+                           if isinstance(user, dict)],
+        'duedate': card.get('duedate'),
+        'comments_count': card.get('commentsCount') or 0,
+        'archived': bool(card.get('archived')),
+        'done': card.get('done'),
+        'owner': owner.get('displayname') or owner.get('uid'),
+        'last_modified': card.get('lastModified'),
+    }
+
+
+def tool_deck_boards(client, config, args):
+    include_archived = bool(args.get('include_archived'))
+    entries = []
+    for board in client.deck_boards():
+        if board.get('archived') and not include_archived:
+            continue
+        owner = board.get('owner') or {}
+        entries.append({
+            'id': board.get('id'),
+            'title': board.get('title') or '',
+            'color': board.get('color') or '',
+            'archived': bool(board.get('archived')),
+            'owner': owner.get('displayname') or owner.get('uid') or '',
+            'permissions': board.get('permissions') or {},
+            'labels': deck_labels(board.get('labels')),
+            'shared_with': [
+                (entry.get('participant') or {}).get('displayname')
+                or (entry.get('participant') or {}).get('uid') or ''
+                for entry in board.get('acl') or [] if isinstance(entry, dict)
+            ],
+        })
+    return {'count': len(entries), 'boards': entries}
+
+
+def tool_deck_cards(client, config, args):
+    board = resolve_deck_board(client, args.get('board'))
+    stacks = client.deck_stacks(board['id'])
+    if args.get('stack') is not None:
+        stacks = [resolve_deck_stack(stacks, args.get('stack'))]
+    limit = parse_limit(args.get('limit'), 200, maximum=500)
+    include_archived = bool(args.get('include_archived'))
+    labels_by_id = {label['id']: label.get('title') or ''
+                    for label in board.get('labels') or [] if isinstance(label, dict)}
+    cards = []
+    for stack in sorted(stacks, key=lambda item: item.get('order') or 0):
+        for card in stack.get('cards') or []:
+            if card.get('archived') and not include_archived:
+                continue
+            cards.append(deck_card_summary(card, stack, labels_by_id))
+    truncated = len(cards) > limit
+    return {
+        'board': {'id': board.get('id'), 'title': board.get('title') or ''},
+        'count': min(len(cards), limit),
+        'truncated': truncated,
+        'cards': cards[:limit],
+    }
+
+
+def tool_deck_create_card(client, config, args):
+    board = resolve_deck_board(client, args.get('board'))
+    stacks = client.deck_stacks(board['id'])
+    stack = resolve_deck_stack(stacks, args.get('stack'))
+    title = str(args.get('title') or '').strip()
+    if not title:
+        raise ToolError('title is required')
+    if len(title) > 255:
+        raise ToolError('title is too long (max 255 characters)')
+    description = str(args.get('description') or '')
+    if len(description) > DECK_MAX_DESCRIPTION:
+        raise ToolError(f'description is too long (max {DECK_MAX_DESCRIPTION} characters)')
+    order = args.get('order', 999)
+    if isinstance(order, bool) or not isinstance(order, int):
+        raise ToolError('order must be an integer')
+    labels = args.get('labels') or []
+    if not isinstance(labels, list) or any(isinstance(item, bool) or not isinstance(item, int)
+                                          for item in labels):
+        raise ToolError('labels must be an array of Deck label ids')
+    known = {label['id'] for label in board.get('labels') or [] if isinstance(label, dict)}
+    unknown = [label for label in labels if label not in known]
+    if unknown:
+        raise ToolError(f'Unknown Deck labels on this board: {unknown}')
+    card = client.deck_create_card(board['id'], stack['id'], {
+        'title': title, 'type': 'plain', 'order': order,
+        'description': description, 'stackId': stack['id'], 'labels': labels,
+    })
+    # The create response is built before the labels are attached, so re-read
+    # the card to return the same shape as nextcloud_deck_cards.
+    card = client.deck_card(board['id'], stack['id'], card['id'])
+    labels_by_id = {label['id']: label.get('title') or ''
+                    for label in board.get('labels') or [] if isinstance(label, dict)}
+    return {'created': True, 'board': board.get('id'),
+            'card': deck_card_summary(card, stack, labels_by_id)}
+
+
+def tool_deck_update_card(client, config, args):
+    board = resolve_deck_board(client, args.get('board'))
+    card_id = deck_int(args.get('card_id'), 'card_id')
+    stacks = client.deck_stacks(board['id'])
+    stack, card = find_deck_card(stacks, card_id)
+    labels_by_id = {label['id']: label.get('title') or ''
+                    for label in board.get('labels') or [] if isinstance(label, dict)}
+    title = str(card.get('title') or '')
+    if 'title' in args:
+        title = str(args.get('title') or '').strip()
+        if not title:
+            raise ToolError('title must not be empty')
+    description = str(card.get('description') or '')
+    if 'description' in args:
+        description = str(args.get('description') or '')
+    if len(description) > DECK_MAX_DESCRIPTION:
+        raise ToolError(f'description is too long (max {DECK_MAX_DESCRIPTION} characters)')
+    target = stack
+    if args.get('stack') is not None:
+        target = resolve_deck_stack(stacks, args.get('stack'))
+    changed = client.deck_update_card(board['id'], stack['id'], card_id, {
+        'title': title,
+        'type': card.get('type') or 'plain',
+        'owner': (card.get('owner') or {}).get('uid') or client.user_id,
+        'description': description,
+        'order': card.get('order') or 0,
+        'stackId': stack['id'],
+        'duedate': card.get('duedate'),
+        'startdate': card.get('startdate'),
+    })
+    if target['id'] != stack['id'] or 'order' in args:
+        order = args.get('order', 0)
+        if isinstance(order, bool) or not isinstance(order, int):
+            raise ToolError('order must be an integer')
+        client.deck_move_card(board['id'], card_id, target['id'], order)
+        changed = client.deck_card(board['id'], target['id'], card_id)
+    else:
+        changed = client.deck_card(board['id'], stack['id'], card_id)
+    return {'updated': True, 'board': board.get('id'),
+            'card': deck_card_summary(changed, target, labels_by_id)}
+
+
+def tool_deck_move_card(client, config, args):
+    board = resolve_deck_board(client, args.get('board'))
+    card_id = deck_int(args.get('card_id'), 'card_id')
+    stacks = client.deck_stacks(board['id'])
+    stack, _card = find_deck_card(stacks, card_id)
+    target = resolve_deck_stack(stacks, args.get('stack'))
+    order = args.get('order', 0)
+    if isinstance(order, bool) or not isinstance(order, int):
+        raise ToolError('order must be an integer')
+    client.deck_move_card(board['id'], card_id, target['id'], order)
+    moved = client.deck_card(board['id'], target['id'], card_id)
+    labels_by_id = {label['id']: label.get('title') or ''
+                    for label in board.get('labels') or [] if isinstance(label, dict)}
+    return {'moved': True, 'board': board.get('id'),
+            'from': stack.get('title'), 'to': target.get('title'),
+            'card': deck_card_summary(moved, target, labels_by_id)}
+
+
+def deck_comment_summary(comment):
+    return {
+        'id': comment.get('id'),
+        'message': comment.get('message') or '',
+        'author': comment.get('actorDisplayName') or comment.get('actorId') or '',
+        'created': comment.get('creationDateTime'),
+    }
+
+
+def tool_deck_comments(client, config, args):
+    card_id = deck_int(args.get('card_id'), 'card_id')
+    limit = parse_limit(args.get('limit'), 20, maximum=100)
+    offset = args.get('offset', 0)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ToolError('offset must be a non-negative integer')
+    comments = client.deck_comments(card_id, limit, offset)
+    return {'card_id': card_id, 'count': len(comments),
+            'comments': [deck_comment_summary(comment) for comment in comments]}
+
+
+def tool_deck_add_comment(client, config, args):
+    card_id = deck_int(args.get('card_id'), 'card_id')
+    message = str(args.get('message') or '').strip()
+    if not message:
+        raise ToolError('message is required')
+    if len(message) > DECK_MAX_COMMENT:
+        raise ToolError(f'message is too long (max {DECK_MAX_COMMENT} characters)')
+    comment = client.deck_add_comment(card_id, message)
+    return {'added': True, 'card_id': card_id, 'comment': deck_comment_summary(comment)}
+
+
 TOOLS = [
     Tool('nextcloud_whoami',
          'Return the connected Nextcloud user (ID and display name). '
@@ -2010,6 +2393,86 @@ TOOLS = [
                                                   'overlaps an existing busy event'}},
                 ['calendar', 'summary', 'start']),
          tool_create_event, write=True),
+    Tool('nextcloud_deck_boards',
+         'List Deck boards visible to the caller (id, title, owner, permissions, '
+         'labels, shared-with). Needs the Nextcloud Deck app; answers a clear '
+         'error when the deck capability is missing.',
+         schema({'include_archived': {'type': 'boolean',
+                                      'description': 'Include archived boards (default false)'}}),
+         tool_deck_boards),
+    Tool('nextcloud_deck_cards',
+         'List cards on a Deck board, with descriptions and labels. Accepts a board '
+         'id or title and optionally a stack (column) id or title. Use it to read '
+         'what people wrote on the board.',
+         schema({'board': {'type': ['string', 'integer'],
+                           'description': 'Board id or title'},
+                 'stack': {'type': ['string', 'integer'],
+                           'description': 'Stack (column) id or title; default: every stack'},
+                 'include_archived': {'type': 'boolean',
+                                      'description': 'Include archived cards (default false)'},
+                 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500,
+                           'description': 'Maximum cards to return (default 200)'}},
+                ['board']),
+         tool_deck_cards),
+    Tool('nextcloud_deck_create_card',
+         'Create a card on a Deck board. Labels are Deck label ids from '
+         'nextcloud_deck_boards. The card is created in the given stack (column).',
+         schema({'board': {'type': ['string', 'integer'],
+                           'description': 'Board id or title'},
+                 'stack': {'type': ['string', 'integer'],
+                           'description': 'Stack (column) id or title'},
+                 'title': {'type': 'string', 'description': 'Card title'},
+                 'description': {'type': 'string',
+                                 'description': 'Markdown description (max 16 KiB)'},
+                 'order': {'type': 'integer',
+                           'description': 'Position in the stack (default 999, the bottom)'},
+                 'labels': {'type': 'array', 'items': {'type': 'integer'},
+                            'description': 'Deck label ids to assign'}},
+                ['board', 'stack', 'title']),
+         tool_deck_create_card, write=True),
+    Tool('nextcloud_deck_update_card',
+         'Update a Deck card title or description, and optionally move it to another '
+         'stack. Only the fields you pass change; the rest stay as they are.',
+         schema({'board': {'type': ['string', 'integer'],
+                           'description': 'Board id or title'},
+                 'card_id': {'type': 'integer', 'description': 'Card id'},
+                 'title': {'type': 'string'},
+                 'description': {'type': 'string',
+                                 'description': 'Markdown description (max 16 KiB)'},
+                 'stack': {'type': ['string', 'integer'],
+                           'description': 'Move the card to this stack (column) id or title'},
+                 'order': {'type': 'integer',
+                           'description': 'Position in the target stack when moving'}},
+                ['board', 'card_id']),
+         tool_deck_update_card, write=True),
+    Tool('nextcloud_deck_move_card',
+         'Move a Deck card to another stack (column), optionally at a given position.',
+         schema({'board': {'type': ['string', 'integer'],
+                           'description': 'Board id or title'},
+                 'card_id': {'type': 'integer', 'description': 'Card id'},
+                 'stack': {'type': ['string', 'integer'],
+                           'description': 'Target stack (column) id or title'},
+                 'order': {'type': 'integer',
+                           'description': 'Position in the target stack (default 0, the top)'}},
+                ['board', 'card_id', 'stack']),
+         tool_deck_move_card, write=True),
+    Tool('nextcloud_deck_comments',
+         'List comments on a Deck card, oldest first, with the author and time.',
+         schema({'card_id': {'type': 'integer', 'description': 'Card id'},
+                 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100,
+                           'description': 'Maximum comments (default 20)'},
+                 'offset': {'type': 'integer', 'minimum': 0,
+                            'description': 'Number of comments to skip (default 0)'}},
+                ['card_id']),
+         tool_deck_comments),
+    Tool('nextcloud_deck_add_comment',
+         'Add a comment to a Deck card. Use it to link a card to an issue without '
+         'rewriting the description a person wrote.',
+         schema({'card_id': {'type': 'integer', 'description': 'Card id'},
+                 'message': {'type': 'string',
+                             'description': 'Plain text or Markdown (max 16 KiB)'}},
+                ['card_id', 'message']),
+         tool_deck_add_comment, write=True),
 ]
 
 TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}

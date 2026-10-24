@@ -68,6 +68,9 @@ Read tools:
 | `nextcloud_list_archive` | Zip/tar member list before extracting. |
 | `nextcloud_list_calendars` | Calendars of the account (id, name, color, writable, components). |
 | `nextcloud_list_events` | Events overlapping a time range (recurring events expanded). |
+| `nextcloud_deck_boards` | Visible Deck boards with labels, permissions and shares. |
+| `nextcloud_deck_cards` | Cards on a Deck board, with descriptions and labels. |
+| `nextcloud_deck_comments` | Comments on a Deck card (author and time). |
 
 Write tools:
 
@@ -82,6 +85,10 @@ Write tools:
 | `nextcloud_create_zip` | Pack files/folders into a zip on Nextcloud. |
 | `nextcloud_extract_archive` | Extract a zip/tar into a folder. |
 | `nextcloud_create_event` | Create a VEVENT; refuses overlaps unless `allow_overlap=true`. |
+| `nextcloud_deck_create_card` | Create a card (title, description, label ids, position). |
+| `nextcloud_deck_update_card` | Update a card title/description and optionally move it. |
+| `nextcloud_deck_move_card` | Move a card to another stack (column). |
+| `nextcloud_deck_add_comment` | Comment on a card, for example with an issue URL. |
 
 The three "tag tools only" entries are hidden from `tools/list` and answer a
 clear error while the tag API is not configured. With
@@ -105,6 +112,25 @@ Calendar notes:
   `NEXTCLOUD_MCP_TIMEZONE` (default: the host's local timezone). Recurrence
   rules are expanded for `DAILY`, `WEEKLY`, `MONTHLY` and `YEARLY`; other
   frequencies are reported as a warning and not expanded.
+
+Deck notes:
+
+- The Deck tools need the Nextcloud Deck app. When the `deck` capability is
+  missing from `/ocs/v2.php/cloud/capabilities`, they answer that the Deck app
+  is not available instead of a generic API failure.
+- `nextcloud_deck_boards` and `nextcloud_deck_cards` accept a board or stack
+  id as well as its exact title (case-insensitive). Titles that match more
+  than one board/stack are refused with the ids to disambiguate.
+- `nextcloud_deck_cards` returns the card description (up to 16 KiB; longer
+  descriptions are marked `description_truncated`), labels, assignees, due
+  date and comment count. Cards are ordered by stack order and card order.
+- `nextcloud_deck_create_card` and `nextcloud_deck_update_card` write with the
+  caller's own Deck permissions. Creating or editing a card on a board where
+  the caller only has read access is refused by Nextcloud (HTTP 403).
+- `nextcloud_deck_add_comment` is the least destructive way to attach an issue
+  URL to a card: it leaves the description a person wrote untouched.
+- Deck's card creation response does not include newly assigned labels, so the
+  tool re-reads the card before answering.
 
 Each tool carries the JSON Schema returned as `inputSchema` by `tools/list`.
 `outputSchema`/`structuredContent` are **not implemented**: results are
@@ -425,6 +451,16 @@ Nextcloud MCPサーバーは、AIエージェント（opencode等）にNextcloud
 一覧の既定範囲は `NEXTCLOUD_MCP_TIMEZONE`（既定はホストのローカルタイム）を
 使います。繰り返し規則は `DAILY`・`WEEKLY`・`MONTHLY`・`YEARLY` を展開し、
 それ以外は警告として報告します。
+
+Deckは `nextcloud_deck_boards`・`nextcloud_deck_cards`・
+`nextcloud_deck_create_card`・`nextcloud_deck_update_card`・
+`nextcloud_deck_move_card`・`nextcloud_deck_comments`・
+`nextcloud_deck_add_comment` の7ツールです。ボードと列はIDのほか名前でも
+指定でき、カードの説明（16 KiBまで）をそのまま返すので、AIは人が書いた
+依頼を読んでGitHub issueなどに変換できます。コメント追加は説明文を書き換え
+ずにissueのURLを残せるので、人が書いた本文を壊しません。Deckアプリが有効で
+ない場合（`/ocs/v2.php/cloud/capabilities` に `deck` が無い場合）は明確な
+エラーを返します。
 
 タグ編集ツール（`nextcloud_read_music_tags`・`nextcloud_search_musicbrainz`・
 `nextcloud_write_music_tags`）は `NEXTCLOUD_MCP_TAG_API_URL` と
